@@ -12,6 +12,13 @@ models_vol = modal.Volume.from_name("bfs-models", create_if_missing=True)
 jobs_vol = modal.Volume.from_name("bfs-jobs", create_if_missing=True)
 MODELS, JOBS = "/models", "/jobs"
 GPU_USD_PER_SEC = 1.95 / 3600  # L40S, approx
+# quality presets used by every endpoint ("best" = previous behaviour)
+PRESETS = {
+    "best": dict(res=1024, href=768, key_step=1, taps=2),
+    "fast": dict(res=832, href=640, key_step=2, taps=2),
+}
+BLEND_CHUNK, BLEND_PAD = 24, 6       # frames per parallel blend container, overlap frames each side
+KEEP_DAYS = 14                       # outputs / uploads older than this are deleted automatically
 
 gpu_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -47,8 +54,11 @@ BODY_RES, HEAD_RES = 768, 640
 
 
 # ----------------------------------------------------------------------------- GPU worker (ComfyUI)
-def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES):
-    return {
+PROMPT3 = PROMPT + (". <image3> is the previous video frame already swapped: keep the new head looking exactly as in <image3> (same skin texture, hair strands, lighting and sharpness), only adapting the pose and expression from <image1>")
+
+
+def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES, prev=None):
+    g = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_int8_convrot.safetensors", "type": "qwen_image", "device": "default"}},
         "3": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"}},
@@ -67,6 +77,12 @@ def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES):
         "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["3", 0]}},
         "15": {"class_type": "SaveImage", "inputs": {"images": ["14", 0], "filename_prefix": "out"}},
     }
+    if prev:
+        g["16"] = {"class_type": "LoadImage", "inputs": {"image": prev}}
+        g["17"] = {"class_type": "ImageScale", "inputs": {"image": ["16", 0], "upscale_method": "lanczos", "width": res, "height": res, "crop": "disabled"}}
+        g["11"]["inputs"]["images.image_3"] = ["17", 0]
+        g["11"]["inputs"]["prompt"] = PROMPT3
+    return g
 
 
 @app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=4)
@@ -94,6 +110,38 @@ class Worker:
             return json.load(urllib.request.urlopen(req))
         except urllib.error.HTTPError as e:
             raise RuntimeError(e.read().decode())
+
+    @modal.method()
+    def process_seq(self, chain: list, head_png: bytes, steps: int = 8, sampler: str = "euler", seed: int = 42, res: int = BODY_RES, href: int = HEAD_RES):
+        """chain: [(idx, crop_png)] in time order. Each frame gets the previous generated frame as a 3rd reference."""
+        os.makedirs("/comfy/input", exist_ok=True)
+        hname = f"head_{uuid.uuid4().hex[:8]}.png"
+        open(f"/comfy/input/{hname}", "wb").write(head_png)
+        results, prev_png, t0 = [], None, time.time()
+        for idx, b in chain:
+            bname = f"b_{uuid.uuid4().hex[:8]}.png"
+            open(f"/comfy/input/{bname}", "wb").write(b)
+            pname = None
+            if prev_png is not None:
+                pname = f"p_{uuid.uuid4().hex[:8]}.png"
+                open(f"/comfy/input/{pname}", "wb").write(prev_png)
+            pid = self._post({"prompt": _graph(bname, hname, seed, steps, sampler, res, href, pname)})["prompt_id"]
+            while True:
+                h = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
+                if pid in h:
+                    break
+                time.sleep(0.5)
+            if h[pid]["status"].get("status_str") != "success":
+                raise RuntimeError("comfy failed: " + json.dumps(h[pid]["status"])[:800])
+            im = h[pid]["outputs"]["15"]["images"][0]
+            q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
+            prev_png = urllib.request.urlopen(f"http://127.0.0.1:8188/view?{q}").read()
+            results.append((idx, prev_png))
+            os.remove(f"/comfy/input/{bname}")
+            if pname:
+                os.remove(f"/comfy/input/{pname}")
+        print(f"chain of {len(chain)} done in {time.time()-t0:.1f}s", flush=True)
+        return results
 
     @modal.method()
     def process(self, batch: list, head_png: bytes, steps: int = 8, sampler: str = "euler", seed: int = 42, res: int = BODY_RES, href: int = HEAD_RES):
@@ -366,6 +414,74 @@ def swap(template_id: str, source_face_url: str, start_frame: int = 0, max_frame
                    "total_s": round(time.time() - t0, 1), "model": "Qwen-Image-2.1 + bfs_head_v1.1_qwen_2.1"}
 
 
+def _cleanup(keep_days=KEEP_DAYS):
+    """Delete old outputs / uploads / temp folders so storage stays inside the free allowance.
+    Templates (video.mp4 + track.json) are kept so they can be re-used."""
+    import shutil
+    cut = time.time() - keep_days * 86400
+    removed = 0
+    for root, dirs, files in os.walk(JOBS):
+        for nm in list(dirs):
+            p = os.path.join(root, nm)
+            if (nm.startswith("raw_") or nm.startswith("parts_")) and os.path.getmtime(p) < time.time() - 86400:
+                shutil.rmtree(p, ignore_errors=True)
+                dirs.remove(nm)
+                removed += 1
+        for nm in files:
+            if nm in ("video.mp4", "track.json"):
+                continue
+            p = os.path.join(root, nm)
+            if os.path.getmtime(p) < cut:
+                os.remove(p)
+                removed += 1
+    return removed
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=1, memory=2048, timeout=5400)
+def swap_job(template_id: str, source_face_url: str, quality: str = "fast", start_frame: int = 0, max_frames: int = 0,
+             max_cost_usd: float = 3.0, seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "",
+             dry_run: bool = False, keep_raw: bool = False):
+    """Video head swap: GPU stage once, then blending split over many small CPU containers, then join + audio."""
+    import shutil
+    t0 = time.time()
+    preset = dict(PRESETS.get(quality, PRESETS["best"]))
+    common = dict(seed=seed, steps=steps, sampler=sampler, seg_mask=True, **preset)
+    g = swap2.remote(template_id, source_face_url, start_frame=start_frame, max_frames=max_frames, max_cost_usd=max_cost_usd,
+                     dry_run=dry_run, gpu_only=True, **common)
+    if dry_run or g.get("aborted"):
+        return g
+    raw, fps, end = g["raw_dir"], g["fps"], g["end"]
+    tag = raw.replace("raw_", "")
+    calls = []
+    for a in range(start_frame, end, BLEND_CHUNK):
+        b = min(end, a + BLEND_CHUNK)
+        s0 = max(start_frame, a - BLEND_PAD)
+        e0 = min(end, b + BLEND_PAD)
+        calls.append(blend_part.spawn(template_id, source_face_url, start_frame=s0, max_frames=e0 - s0, reuse_raw=raw,
+                                      core=[a, b], out_name=f"parts_{tag}/{a:06d}.mp4", max_cost_usd=99, **common))
+    parts = [c.get()["part"] for c in calls]
+    jobs_vol.reload()
+    d = f"{JOBS}/{template_id}"
+    lst = f"{d}/parts_{tag}/list.txt"
+    open(lst, "w").write("".join(f"file '{d}/{p}'\n" for p in parts))
+    out_path = f"{d}/out2_{tag}.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
+                    "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4",
+                    "-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", out_path], check=True)
+    shutil.rmtree(f"{d}/parts_{tag}", ignore_errors=True)
+    if not keep_raw:
+        shutil.rmtree(f"{d}/{raw}", ignore_errors=True)
+    try:
+        cleaned = _cleanup()
+    except Exception:
+        cleaned = -1
+    jobs_vol.commit()
+    uploaded = _put_file(out_path, output_put_url, "video/mp4") if output_put_url else None
+    return {k: g[k] for k in ("frames_range", "head_frames", "key_frames", "est_cost_usd", "gpu_wall_s") if k in g} | {
+        "output": out_path.replace(JOBS + "/", ""), "quality": quality, "blend_parts": len(parts),
+        "total_s": round(time.time() - t0, 1), "uploaded": uploaded, "old_files_removed": cleaned}
+
+
 # ----------------------------------------------------------------------------- HTTP API
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, secrets=[modal.Secret.from_name("bfs-api-token")], timeout=600)
 @modal.asgi_app(label="bfs-headswap-api")
@@ -392,10 +508,8 @@ def web():
         jobs_vol.reload()
         if not os.path.exists(f"{JOBS}/{body['template_id']}/track.json"):
             raise HTTPException(404, "template not preprocessed: call /preprocess first")
-        kw = {k: body[k] for k in ("start_frame", "max_frames", "max_cost_usd", "seed", "steps", "sampler", "dry_run", "output_put_url") if k in body}
-        kw.setdefault("max_cost_usd", 3.0)
-        preset = dict(res=1024, href=768, key_step=1, taps=2) if body.get("quality", "best") == "best" else dict(res=832, href=704, key_step=2, taps=1)
-        fc = swap2.spawn(body["template_id"], body["source_face_url"], **preset, **kw)
+        kw = {k: body[k] for k in ("quality", "start_frame", "max_frames", "max_cost_usd", "seed", "steps", "sampler", "dry_run", "output_put_url") if k in body}
+        fc = swap_job.spawn(body["template_id"], body["source_face_url"], **kw)
         return {"job_id": fc.object_id, "status": "running"}
 
     @api.post("/swap-video")
@@ -580,9 +694,20 @@ TIGHT = dict(ax=0.72, ay=0.90, dy=0.24, fe=0.08)
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=24576, timeout=3600)
-def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_frames: int = 0, res: int = 896, href: int = 704,
+def swap2(*a, **kw):
+    return _swap2_impl(*a, **kw)
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=8192, timeout=1800, max_containers=12)
+def blend_part(*a, **kw):
+    """Blends one slice of the video from already generated heads (reuse_raw) - many run in parallel."""
+    return _swap2_impl(*a, **kw)
+
+
+def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, max_frames: int = 0, res: int = 896, href: int = 704,
           max_cost_usd: float = 1.2, seed: int = 42, steps: int = 8, sampler: str = "euler", dry_run: bool = False,
-          reuse_raw: str = "", promote_thr: float = 6.0, key_step: int = 2, grain: bool = False, grain_max: float = 2.5, fix_top: bool = True, align_fix: bool = False, align_sigma: float = 4.0, taps: int = 1, seg_mask: bool = True, seg_full: bool = False, output_put_url: str = "", flow_comp: bool = False, soft_match: bool = False):
+          reuse_raw: str = "", promote_thr: float = 6.0, key_step: int = 2, grain: bool = False, grain_max: float = 2.5, fix_top: bool = True, align_fix: bool = False, align_sigma: float = 4.0, taps: int = 1, seg_mask: bool = True, seg_full: bool = False, output_put_url: str = "", flow_comp: bool = False, soft_match: bool = False, seq_ref: int = 0,
+                gpu_only: bool = False, core: list = None, out_name: str = ""):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -648,7 +773,7 @@ def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_fram
                 ks.add(i)
         keys += sorted(ks)
     if reuse_raw:
-        keys = sorted(int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png"))
+        keys = sorted(k for k in (int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png")) if k in frames and sm[k] is not None)
     keyset = set(keys)
     per = 14.0 * (res / 896) ** 2
     est = (len(keys) * per + min(4, max(1, len(keys) // 8)) * 110) * GPU_USD_PER_SEC
@@ -683,8 +808,28 @@ def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_fram
         for i in keys:
             outs[i] = cv2.imread(f"{d}/{reuse_raw}/{i:04d}.png")
         gpu_wall = 0.0
+    elif seq_ref:
+        chains, cur_c = [], []
+        for (i, png) in crops:
+            if cur_c and (i != cur_c[-1][0] + 1 or len(cur_c) >= seq_ref):
+                chains.append(cur_c)
+                cur_c = []
+            cur_c.append((i, png))
+        if cur_c:
+            chains.append(cur_c)
+        for rs in Worker().process_seq.map(chains, kwargs={"head_png": head_png, "steps": steps, "sampler": sampler, "seed": seed, "res": res, "href": href}):
+            for idx, png in rs:
+                outs[idx] = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+        gpu_wall = time.time() - tg
+        tag = uuid.uuid4().hex[:6]
+        os.makedirs(f"{d}/raw_{tag}", exist_ok=True)
+        for i, o in outs.items():
+            cv2.imwrite(f"{d}/raw_{tag}/{i:04d}.png", o)
+        jobs_vol.commit()
     else:
-        batches = [crops[k:k + 8] for k in range(0, len(crops), 8)]
+        n_gpu = max(1, min(4, round(len(crops) / 40)))
+        size = max(1, min(100, -(-len(crops) // n_gpu)))
+        batches = [crops[k:k + size] for k in range(0, len(crops), size)]
         for rs in Worker().process.map(batches, kwargs={"head_png": head_png, "steps": steps, "sampler": sampler, "seed": seed, "res": res, "href": href}):
             for idx, png in rs:
                 outs[idx] = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
@@ -694,6 +839,10 @@ def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_fram
         for i, o in outs.items():
             cv2.imwrite(f"{d}/raw_{tag}/{i:04d}.png", o)
         jobs_vol.commit()
+
+    if gpu_only:
+        return info | {"raw_dir": f"raw_{tag}", "gpu_wall_s": round(gpu_wall, 1), "gpu_frames": len(outs),
+                       "frames_total": n, "fps": fps, "end": end}
 
     # remove frame-to-frame jitter of the generated head: the model places/scales the face slightly differently on every
     # frame; shift/scale each generated head so its deviation follows a smoothed trajectory
@@ -835,11 +984,18 @@ def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_fram
             new = base.astype(np.float32) * (1 - m) + blend_roi(base, al, weights=wts) * m if al else base.astype(np.float32)
         else:
             ell = _frame_mask(o_t, g, W, H, **TIGHT)[by0:by1, bx0:bx1, 0]
-            a = _aligned(o_t, frames[i - 1], Kc[i - 1], box)
-            b = _aligned(o_t, frames[i + 1], Kc[i + 1], box)
+            ksr = [k for k in run_of[i] if k in keyset]
+            pk = max([k for k in ksr if k < i], default=None)
+            nk = min([k for k in ksr if k > i], default=None)
+            if pk is None or nk is None:
+                pk = nk = (pk if pk is not None else nk)
+            a = _aligned(o_t, frames[pk], Kc[pk], box)
+            b = _aligned(o_t, frames[nk], Kc[nk], box)
             m = (ell)[..., None]
+            wb = 0.5 if pk == nk else (i - pk) / float(nk - pk)
             dab = np.abs(cv2.GaussianBlur(a, (0, 0), 3).astype(np.float32) - cv2.GaussianBlur(b, (0, 0), 3).astype(np.float32)).mean(2)[..., None]
-            pick = np.where(dab < 25, 0.5 * a.astype(np.float32) + 0.5 * b.astype(np.float32), a.astype(np.float32))
+            near = a.astype(np.float32) if wb < 0.5 else b.astype(np.float32)
+            pick = np.where(dab < 25, (1 - wb) * a.astype(np.float32) + wb * b.astype(np.float32), near)
             new = o_t[by0:by1, bx0:bx1].astype(np.float32) * (1 - m) + pick * m
         res_f[by0:by1, bx0:bx1] = new.clip(0, 255).astype(np.uint8)
         if fix_top and by0 == 0:
@@ -866,6 +1022,18 @@ def swap2(template_id: str, source_face_url: str, start_frame: int = 0, max_fram
                     res_f[by0:by1, bx0:bx1] = roi.clip(0, 255).astype(np.uint8)
         final[i] = res_f
 
+    if core:
+        out_path = f"{d}/{out_name}"
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+               "-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p", out_path]
+        p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        for i in range(core[0], core[1]):
+            p.stdin.write(final.get(i, frames[i]).tobytes())
+        p.stdin.close()
+        p.wait()
+        jobs_vol.commit()
+        return {"part": out_name, "frames": core}
     out_path = f"{d}/out2_{tag}.mp4"
     cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
            "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4", "-map", "0:v", "-map", "1:a?",
@@ -974,14 +1142,14 @@ def _geom_clamped(box, W, H):
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=16384, timeout=1800)
-def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", face_index: int = -1, quality: str = "best",
+def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", face_index: int = -1, quality: str = "fast",
                seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "", max_cost_usd: float = 0.5):
     """Head swap on ONE image. image_url: the picture to edit; source_face_url: the head to put in.
     Pick the person to replace with target_face_url (a face crop of them), face_index (0 = left-most) or by default the largest face."""
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
-    res, href = (1024, 768) if quality == "best" else (768, 640)
+    res, href = PRESETS.get(quality, PRESETS["best"])["res"], PRESETS.get(quality, PRESETS["best"])["href"]
     os.makedirs(f"{JOBS}/images", exist_ok=True)
     jid = uuid.uuid4().hex[:10]
     if image_url.startswith("volume:test/") and ".." not in image_url:   # internal test shortcut, confined to test/
@@ -1050,8 +1218,8 @@ def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", 
             "model": "Qwen-Image-2.1 + bfs_head_v1.1_qwen_2.1"}
 
 
-@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=24576, timeout=3600)
-def swap_video(source_face_url: str, template_id: str = "", video_url: str = "", target_face_url: str = "", quality: str = "best",
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=1, memory=2048, timeout=5400)
+def swap_video(source_face_url: str, template_id: str = "", video_url: str = "", target_face_url: str = "", quality: str = "fast",
                max_cost_usd: float = 3.0, output_put_url: str = ""):
     """One call: preprocess (if needed) + head swap. Pass template_id of an already-preprocessed video, or video_url + target_face_url."""
     jobs_vol.reload()
@@ -1060,6 +1228,5 @@ def swap_video(source_face_url: str, template_id: str = "", video_url: str = "",
         if not (video_url and target_face_url):
             raise RuntimeError("template not preprocessed: pass video_url and target_face_url")
         preprocess.remote(tid, video_url, target_face_url)
-    kw = dict(res=1024, href=768, key_step=1, taps=1) if quality == "best" else dict(res=832, href=704, key_step=2, taps=1)
-    r = swap2.remote(tid, source_face_url, max_cost_usd=max_cost_usd, output_put_url=output_put_url, **kw)
+    r = swap_job.remote(tid, source_face_url, quality=quality, max_cost_usd=max_cost_usd, output_put_url=output_put_url)
     return r | {"template_id": tid, "quality": quality}

@@ -57,24 +57,46 @@ curl -X POST "$BASE/swap" -H "Content-Type: application/json" \
 
 curl "$BASE/jobs/<job_id>"            # -> result.download_url
 ```
-`/swap` options: `start_frame`, `max_frames` (process only part of the video), `max_cost_usd`, `output_put_url`,
-`quality` (`"best"` = every head frame at 1024 px; anything else = cheaper, every 2nd frame at 832 px + interpolation).
-`POST /swap-video` does preprocess + swap in one call (`video_url`, `target_face_url`, `source_face_url`).
+`/swap` options: `start_frame`, `max_frames` (process only part of the video), `max_cost_usd` (default 3),
+`output_put_url`, `dry_run` (only returns frame count + cost estimate, no GPU), and `quality`:
 
-## Measured time and cost (L40S, ~US$1.95/h)
+| `quality` | What it does |
+|---|---|
+| `"fast"` (**default**) | 832 px, every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too) |
+| `"best"` | 1024 px, every head frame generated |
+
+`POST /swap-video` does preprocess + swap in one call (`video_url`, `target_face_url`, `source_face_url`).
+`/swap-image` uses the same `quality` values (default `"fast"`).
+
+### How a video job runs
+1. GPU stage once (`swap2`, `gpu_only`): heads are generated on 1-4 L40S containers (>= ~40 frames each, fewer cold starts).
+2. Blending is split into 24-frame slices (6 frames overlap each side) and run in parallel on up to 12 small CPU
+   containers (`blend_part`).
+3. `swap_job` joins the slices with ffmpeg, adds the original audio and deletes the temporary files.
+
+### Idle cost and storage
+- Nothing stays running: GPU scales to zero 15 s after a job, CPU/API containers also scale to zero -> **$0 compute when idle**.
+- Temporary frame folders are deleted after each job; outputs/uploads older than **14 days** are deleted automatically
+  (`KEEP_DAYS`). Preprocessed templates (`video.mp4` + `track.json`) are kept.
+
+## Time and cost (estimates, Modal L40S)
 
 | Job | Time | Approx. cost |
 |---|---|---|
-| Image (1080x1920) | ~1-2 min (mostly cold start) | ~$0.03-0.07 |
-| Video, 15.5 s, `best` | ~30 min (15 min GPU + 15 min CPU blending) | ~$1.5-2 |
+| Image (1080x1920) | ~1-2 min (mostly cold start) | ~$0.10-0.20 |
+| Video, 8 s, `fast` | ~8-10 min | ~$1.5-2 |
+| Video, 8 s, `best` | ~18-20 min | ~$3.5-4 |
 
+Check real usage with `modal billing report --for "this month"`; estimates have been low in the past.
 Very large images (tens of megapixels) are slower because blending runs on the full image.
 
 ## Known limitations
 
 - Each frame's head is generated independently, so some frame-to-frame shimmer remains.
 - In some side-profile frames a thin sliver of the old hair can remain at the very edge of the picture.
-- Fast zooms warp in the cheaper (`quality` != `best`) mode.
+- Very fast zooms / head turns can warp slightly in `fast` mode; use `"quality":"best"` for such footage.
+- The parallel join step (`swap_job`) was verified in parts only (slices blended correctly); check the first full
+  video produced with this version.
 
 ## Licences / responsible use
 
