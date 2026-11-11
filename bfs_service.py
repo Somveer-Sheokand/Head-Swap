@@ -484,8 +484,8 @@ def _cleanup(keep_days=KEEP_DAYS):
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=1, memory=2048, timeout=5400)
-def swap_job(template_id: str, source_face_url: str, quality: str = "fast", start_frame: int = 0, max_frames: int = 0,
-             max_cost_usd: float = 3.0, seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "",
+def swap_job(template_id: str, source_face_url: str, quality: str = "best", start_frame: int = 0, max_frames: int = 0,
+             max_cost_usd: float = 5.0, seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "",
              dry_run: bool = False, keep_raw: bool = False):
     """Video head swap: GPU stage once, then blending split over many small CPU containers, then join + audio."""
     import shutil
@@ -1190,7 +1190,7 @@ def _geom_clamped(box, W, H):
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=16384, timeout=1800)
-def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", face_index: int = -1, quality: str = "fast",
+def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", face_index: int = -1, quality: str = "best",
                seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "", max_cost_usd: float = 0.5):
     """Head swap on ONE image. image_url: the picture to edit; source_face_url: the head to put in.
     Pick the person to replace with target_face_url (a face crop of them), face_index (0 = left-most) or by default the largest face."""
@@ -1269,8 +1269,8 @@ def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", 
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=1, memory=2048, timeout=5400)
-def swap_video(source_face_url: str, template_id: str = "", video_url: str = "", target_face_url: str = "", quality: str = "fast",
-               max_cost_usd: float = 3.0, output_put_url: str = ""):
+def swap_video(source_face_url: str, template_id: str = "", video_url: str = "", target_face_url: str = "", quality: str = "best",
+               max_cost_usd: float = 5.0, output_put_url: str = ""):
     """One call: preprocess (if needed) + head swap. Pass template_id of an already-preprocessed video, or video_url + target_face_url."""
     jobs_vol.reload()
     tid = template_id or uuid.uuid4().hex

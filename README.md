@@ -57,16 +57,16 @@ curl -X POST "$BASE/swap" -H "Content-Type: application/json" \
 
 curl "$BASE/jobs/<job_id>"            # -> result.download_url
 ```
-`/swap` options: `start_frame`, `max_frames` (process only part of the video), `max_cost_usd` (default 3),
+`/swap` options: `start_frame`, `max_frames` (process only part of the video), `max_cost_usd` (default 5),
 `output_put_url`, `dry_run` (only returns frame count + cost estimate, no GPU), and `quality`:
 
 | `quality` | What it does |
 |---|---|
-| `"fast"` (**default**) | up to 832 px (smaller for small / far-away heads, min 640 px), every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too) |
-| `"best"` | 1024 px, every head frame generated |
+| `"best"` (**default**) | 1024 px, every head frame generated - sharpest result, needed for close-up / large heads |
+| `"fast"` | up to 832 px (smaller for small / far-away heads, min 640 px), every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too). About 2x cheaper, but visibly softer on close-ups |
 
 `POST /swap-video` does preprocess + swap in one call (`video_url`, `target_face_url`, `source_face_url`).
-`/swap-image` uses the same `quality` values (default `"fast"`).
+`/swap-image` uses the same `quality` values (default `"best"`).
 
 ### How a video job runs
 1. GPU stage once (`swap2`, `gpu_only`): heads are generated on 1-4 L40S containers (>= ~40 frames each, fewer cold starts).
@@ -83,9 +83,12 @@ curl "$BASE/jobs/<job_id>"            # -> result.download_url
 
 | Job | Time | Approx. cost |
 |---|---|---|
-| Image (1080x1920) | ~1-2 min (mostly cold start) | ~$0.10-0.20 |
-| Video, 8 s, `fast` | ~8-10 min | ~$1.5-2 |
-| Video, 8 s, `best` | ~18-20 min | ~$3.5-4 |
+| Image (1080x1920), `best` | ~2-2.5 min (mostly cold start) | ~$0.12-0.20 |
+| Video, 8 s (193 frames), `best` | ~18-22 min | ~$3.5-4.3 |
+| Video, 8 s (193 frames), `fast` | ~12 min (measured) | ~$1.3-1.5 (measured) |
+
+An 8 s `best` video fits under the default `max_cost_usd` of 5; longer videos need a higher limit or
+`start_frame`/`max_frames`.
 
 Check real usage with `modal billing report --for "this month"`; estimates have been low in the past, so the
 built-in cost check (`max_cost_usd`) now multiplies the per-frame estimate by `EST_FACTOR = 2.0`.
@@ -109,8 +112,6 @@ Very large images (tens of megapixels) are slower because blending runs on the f
 - Each frame's head is generated independently, so some frame-to-frame shimmer remains.
 - In some side-profile frames a thin sliver of the old hair can remain at the very edge of the picture.
 - Very fast zooms / head turns can warp slightly in `fast` mode; use `"quality":"best"` for such footage.
-- The parallel join step (`swap_job`) was verified in parts only (slices blended correctly); check the first full
-  video produced with this version.
 
 ## Licences / responsible use
 
