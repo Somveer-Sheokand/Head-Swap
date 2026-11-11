@@ -15,8 +15,16 @@ GPU_USD_PER_SEC = 1.95 / 3600  # L40S, approx
 # quality presets used by every endpoint ("best" = previous behaviour)
 PRESETS = {
     "best": dict(res=1024, href=768, key_step=1, taps=2),
-    "fast": dict(res=832, href=640, key_step=2, taps=2),
+    # adaptive: small / far-away heads are generated at a smaller size (never below MIN_RES) - they are shrunk
+    # to their on-screen size anyway, so the extra pixels cost GPU time without being visible
+    "fast": dict(res=832, href=640, key_step=2, taps=2, adaptive=True),
 }
+MIN_RES = 640
+EST_FACTOR = 2.0                     # real Modal bills were ~2x the plain per-frame estimate (cold starts, idle GPU time)
+
+# Speed-ups that are built in but OFF until they have been tested once on a real job (each needs a redeploy):
+USE_SNAPSHOT = False   # Modal memory + GPU snapshot of the loaded ComfyUI -> cold start ~60-110 s -> ~10-20 s
+USE_SAGE = False       # SageAttention in ComfyUI -> ~15-30 % less GPU time per frame
 BLEND_CHUNK, BLEND_PAD = 24, 6       # frames per parallel blend container, overlap frames each side
 KEEP_DAYS = 14                       # outputs / uploads older than this are deleted automatically
 
@@ -30,6 +38,8 @@ gpu_image = (
         "pip install huggingface_hub websocket-client",
     )
 )
+if USE_SAGE:   # only changes the image when switched on (keeps torch untouched otherwise)
+    gpu_image = gpu_image.pip_install("triton", "sageattention==1.0.6")
 
 cpu_image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -85,16 +95,20 @@ def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES, prev=N
     return g
 
 
-@app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=4)
+_SNAP_OPTS = dict(enable_memory_snapshot=True, experimental_options={"enable_gpu_snapshot": True}) if USE_SNAPSHOT else {}
+
+
+# no min_containers: the GPU scales to zero 15 s after the last job, so an idle app costs nothing
+@app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=4, **_SNAP_OPTS)
 class Worker:
-    @modal.enter()
+    @modal.enter(snap=USE_SNAPSHOT)
     def boot(self):
         for sub in ["diffusion_models", "text_encoders", "vae", "loras"]:
             d = f"/comfy/models/{sub}"
             subprocess.run(["rm", "-rf", d])
             os.symlink(f"{MODELS}/{sub}", d)
-        self.proc = subprocess.Popen(["python", "main.py", "--listen", "127.0.0.1", "--port", "8188"], cwd="/comfy",
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = ["python", "main.py", "--listen", "127.0.0.1", "--port", "8188"] + (["--use-sage-attention"] if USE_SAGE else [])
+        self.proc = subprocess.Popen(cmd, cwd="/comfy", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for _ in range(300):
             try:
                 urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=2)
@@ -103,6 +117,20 @@ class Worker:
                 time.sleep(2)
         else:
             raise RuntimeError("comfy did not start")
+        if USE_SNAPSHOT:
+            self._warmup()   # load every model onto the GPU before the snapshot is taken
+
+    def _warmup(self):
+        """One tiny 1-step generation so all weights are loaded (captured by the snapshot)."""
+        from PIL import Image
+        os.makedirs("/comfy/input", exist_ok=True)
+        Image.new("RGB", (256, 256), (128, 128, 128)).save("/comfy/input/warm.png")
+        pid = self._post({"prompt": _graph("warm.png", "warm.png", 1, 1, "euler", 256, 256)})["prompt_id"]
+        for _ in range(600):
+            h = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
+            if pid in h:
+                break
+            time.sleep(0.5)
 
     def _post(self, data):
         req = urllib.request.Request("http://127.0.0.1:8188/prompt", data=json.dumps(data).encode(), headers={"Content-Type": "application/json"})
@@ -414,6 +442,24 @@ def swap(template_id: str, source_face_url: str, start_frame: int = 0, max_frame
                    "total_s": round(time.time() - t0, 1), "model": "Qwen-Image-2.1 + bfs_head_v1.1_qwen_2.1"}
 
 
+def _res_for_size(S, cap):
+    """Generation size for a head crop that covers S pixels of the source: ~1.25x its on-screen size, multiple of 64."""
+    import math
+    return int(min(cap, max(MIN_RES, math.ceil(1.25 * S / 64) * 64)))
+
+
+def _adaptive_res(template_id, start_frame, max_frames, cap):
+    """One size for the whole job (changing it per frame would add flicker), from the median head-crop size."""
+    import numpy as np
+    jobs_vol.reload()
+    meta = json.load(open(f"{JOBS}/{template_id}/track.json"))
+    n = meta["frames"]
+    end = n if not max_frames else min(n, start_frame + max_frames)
+    sm = _smooth_track(meta["track"], n)
+    sizes = [_geom_base(sm[i])[2] for i in range(start_frame, end) if sm[i] is not None]
+    return _res_for_size(float(np.median(sizes)), cap) if sizes else cap
+
+
 def _cleanup(keep_days=KEEP_DAYS):
     """Delete old outputs / uploads / temp folders so storage stays inside the free allowance.
     Templates (video.mp4 + track.json) are kept so they can be re-used."""
@@ -445,11 +491,13 @@ def swap_job(template_id: str, source_face_url: str, quality: str = "fast", star
     import shutil
     t0 = time.time()
     preset = dict(PRESETS.get(quality, PRESETS["best"]))
+    if preset.pop("adaptive", False):
+        preset["res"] = _adaptive_res(template_id, start_frame, max_frames, preset["res"])
     common = dict(seed=seed, steps=steps, sampler=sampler, seg_mask=True, **preset)
     g = swap2.remote(template_id, source_face_url, start_frame=start_frame, max_frames=max_frames, max_cost_usd=max_cost_usd,
                      dry_run=dry_run, gpu_only=True, **common)
     if dry_run or g.get("aborted"):
-        return g
+        return g | {"quality": quality, "res": preset["res"]}
     raw, fps, end = g["raw_dir"], g["fps"], g["end"]
     tag = raw.replace("raw_", "")
     calls = []
@@ -478,7 +526,7 @@ def swap_job(template_id: str, source_face_url: str, quality: str = "fast", star
     jobs_vol.commit()
     uploaded = _put_file(out_path, output_put_url, "video/mp4") if output_put_url else None
     return {k: g[k] for k in ("frames_range", "head_frames", "key_frames", "est_cost_usd", "gpu_wall_s") if k in g} | {
-        "output": out_path.replace(JOBS + "/", ""), "quality": quality, "blend_parts": len(parts),
+        "output": out_path.replace(JOBS + "/", ""), "quality": quality, "res": preset["res"], "blend_parts": len(parts),
         "total_s": round(time.time() - t0, 1), "uploaded": uploaded, "old_files_removed": cleaned}
 
 
@@ -776,7 +824,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
         keys = sorted(k for k in (int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png")) if k in frames and sm[k] is not None)
     keyset = set(keys)
     per = 14.0 * (res / 896) ** 2
-    est = (len(keys) * per + min(4, max(1, len(keys) // 8)) * 110) * GPU_USD_PER_SEC
+    est = (len(keys) * per + max(1, min(4, round(len(keys) / 40))) * 110) * GPU_USD_PER_SEC * EST_FACTOR
     ev = np.array(list(errs.values())) if errs else np.array([0.0])
     info = {"frames_range": [start_frame, end], "head_frames": len(todo), "key_frames": len(keys), "promoted": int(sum(1 for e in errs.values() if e > promote_thr)),
             "interp_err_pctl_50_75_90_max": [round(float(np.percentile(ev, p)), 2) for p in (50, 75, 90)] + [round(float(ev.max()), 2)],
@@ -1187,9 +1235,11 @@ def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", 
 
     g = _geom_clamped(box, W, H)
     cx_, cy_, S_, w_, h_, bx, by = g
+    if PRESETS.get(quality, PRESETS["best"]).get("adaptive"):
+        res = _res_for_size(S_, res)
     crop, M = _crop(img, cx_, cy_, S_, res)
     sc_ = res / S_
-    est = (res / 1024) ** 2 * 12 + 100
+    est = ((res / 1024) ** 2 * 12 + 100) * EST_FACTOR
     if est * GPU_USD_PER_SEC > max_cost_usd:
         raise RuntimeError("estimated cost above max_cost_usd")
     out = Worker().process.remote([(0, cv2.imencode(".png", crop)[1].tobytes())], head_png, steps=steps, sampler=sampler, seed=seed, res=res, href=href)
@@ -1214,7 +1264,7 @@ def swap_image(image_url: str, source_face_url: str, target_face_url: str = "", 
     cv2.imwrite(outp, final)
     jobs_vol.commit()
     uploaded = _put_file(outp, output_put_url, "image/png") if output_put_url else None
-    return {"output": f"images/{jid}.png", "faces_found": len(faces), "size": [W, H], "seconds": round(time.time() - t0, 1), "uploaded": uploaded,
+    return {"output": f"images/{jid}.png", "faces_found": len(faces), "size": [W, H], "res": res, "seconds": round(time.time() - t0, 1), "uploaded": uploaded,
             "model": "Qwen-Image-2.1 + bfs_head_v1.1_qwen_2.1"}
 
 

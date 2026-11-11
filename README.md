@@ -62,7 +62,7 @@ curl "$BASE/jobs/<job_id>"            # -> result.download_url
 
 | `quality` | What it does |
 |---|---|
-| `"fast"` (**default**) | 832 px, every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too) |
+| `"fast"` (**default**) | up to 832 px (smaller for small / far-away heads, min 640 px), every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too) |
 | `"best"` | 1024 px, every head frame generated |
 
 `POST /swap-video` does preprocess + swap in one call (`video_url`, `target_face_url`, `source_face_url`).
@@ -87,7 +87,21 @@ curl "$BASE/jobs/<job_id>"            # -> result.download_url
 | Video, 8 s, `fast` | ~8-10 min | ~$1.5-2 |
 | Video, 8 s, `best` | ~18-20 min | ~$3.5-4 |
 
-Check real usage with `modal billing report --for "this month"`; estimates have been low in the past.
+Check real usage with `modal billing report --for "this month"`; estimates have been low in the past, so the
+built-in cost check (`max_cost_usd`) now multiplies the per-frame estimate by `EST_FACTOR = 2.0`.
+Use `"dry_run": true` on `/swap` to see the frame count, generation size (`res`) and cost estimate without using a GPU.
+
+### Optional speed-ups (built in, OFF until tested)
+Two switches at the top of `bfs_service.py`. Each needs one short paid test (an image or a 2-second sample) after
+switching it on and redeploying; switch it back off if the test fails.
+
+| Switch | What it does | Expected gain |
+|---|---|---|
+| `USE_SNAPSHOT = True` | Modal memory + GPU snapshot of the loaded ComfyUI (models warmed up before the snapshot) | GPU cold start ~60-110 s -> ~10-20 s; images ~50 % cheaper |
+| `USE_SAGE = True` | SageAttention in ComfyUI (`--use-sage-attention`, adds `sageattention` to the GPU image -> image rebuild) | ~15-30 % less GPU time per frame |
+
+A further option is fewer sampling steps (`"steps": 6` in the `/swap` or `/swap-image` body; default 8). Compare
+quality side by side before making it a default.
 Very large images (tens of megapixels) are slower because blending runs on the full image.
 
 ## Known limitations
