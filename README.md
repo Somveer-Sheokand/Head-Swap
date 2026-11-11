@@ -62,7 +62,7 @@ curl "$BASE/jobs/<job_id>"            # -> result.download_url
 
 | `quality` | What it does |
 |---|---|
-| `"best"` (**default**) | 1024 px, every head frame generated - sharpest result, needed for close-up / large heads |
+| `"best"` (**default**) | 1024 px, every head frame generated - sharpest result, needed for close-up / large heads. Plus a second motion-aligned smoothing pass over +-3 frames (`post_taps`) and a light temporal denoise at the join |
 | `"fast"` | up to 832 px (smaller for small / far-away heads, min 640 px), every 2nd frame generated, frames in between carried by motion (frames where that fails are generated too). About 2x cheaper, but visibly softer on close-ups |
 
 `POST /swap-video` does preprocess + swap in one call (`video_url`, `target_face_url`, `source_face_url`).
@@ -107,9 +107,25 @@ A further option is fewer sampling steps (`"steps": 6` in the `/swap` or `/swap-
 quality side by side before making it a default.
 Very large images (tens of megapixels) are slower because blending runs on the full image.
 
+## Jitter / wobble tests (15.5 s Burger King ad, 208 head frames, same generated heads)
+
+Head flicker = mean |frame - average of its two neighbours| in the head area (lower = steadier). Original footage: **7.10**.
+
+| Variant | Head flicker |
+|---|---|
+| previous `best` (2-frame blend) | 7.98 |
+| + position/scale wobble correction (`align_fix`) | 8.95 - worse, left off |
+| + second smoothing pass +-2 frames | 7.54 |
+| + stronger second pass (`post_taps=3`, or +-2 with heavier weights) | 7.36-7.39 |
+| **+ temporal denoise (now the `best` default)** | **6.87-6.89** |
+
+No ghosting was visible in close-up eating shots. The second pass rejects neighbour pixels that do not match
+(fast motion, hands/food in front of the face), so it does not smear.
+
 ## Known limitations
 
-- Each frame's head is generated independently, so some frame-to-frame shimmer remains.
+- Each frame's head is generated independently; in `best` the smoothing passes bring the head flicker to about the
+  level of the original footage, but very fine hair detail can still shimmer slightly.
 - In some side-profile frames a thin sliver of the old hair can remain at the very edge of the picture.
 - Very fast zooms / head turns can warp slightly in `fast` mode; use `"quality":"best"` for such footage.
 

@@ -14,7 +14,9 @@ MODELS, JOBS = "/models", "/jobs"
 GPU_USD_PER_SEC = 1.95 / 3600  # L40S, approx
 # quality presets used by every endpoint ("best" = previous behaviour)
 PRESETS = {
-    "best": dict(res=1024, href=768, key_step=1, taps=2),
+    # post_*: second motion-aligned temporal pass over the finished heads; denoise: light temporal denoise (ffmpeg
+    # hqdn3d) at the join. Tested on a 15 s close-up ad: head flicker 7.98 -> 6.87 (original footage 7.10), no ghosting
+    "best": dict(res=1024, href=768, key_step=1, taps=2, post_taps=3, post_w=0.8, post_thr=16.0, denoise=True),
     # adaptive: small / far-away heads are generated at a smaller size (never below MIN_RES) - they are shrunk
     # to their on-screen size anyway, so the extra pixels cost GPU time without being visible
     "fast": dict(res=832, href=640, key_step=2, taps=2, adaptive=True),
@@ -483,7 +485,7 @@ def _cleanup(keep_days=KEEP_DAYS):
     return removed
 
 
-@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=1, memory=2048, timeout=5400)
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=4096, timeout=5400)
 def swap_job(template_id: str, source_face_url: str, quality: str = "best", start_frame: int = 0, max_frames: int = 0,
              max_cost_usd: float = 5.0, seed: int = 42, steps: int = 8, sampler: str = "euler", output_put_url: str = "",
              dry_run: bool = False, keep_raw: bool = False):
@@ -493,6 +495,7 @@ def swap_job(template_id: str, source_face_url: str, quality: str = "best", star
     preset = dict(PRESETS.get(quality, PRESETS["best"]))
     if preset.pop("adaptive", False):
         preset["res"] = _adaptive_res(template_id, start_frame, max_frames, preset["res"])
+    denoise = preset.pop("denoise", False)
     common = dict(seed=seed, steps=steps, sampler=sampler, seg_mask=True, **preset)
     g = swap2.remote(template_id, source_face_url, start_frame=start_frame, max_frames=max_frames, max_cost_usd=max_cost_usd,
                      dry_run=dry_run, gpu_only=True, **common)
@@ -515,7 +518,10 @@ def swap_job(template_id: str, source_face_url: str, quality: str = "best", star
     out_path = f"{d}/out2_{tag}.mp4"
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0", "-i", lst,
                     "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4",
-                    "-map", "0:v", "-map", "1:a?", "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-shortest", out_path], check=True)
+                    "-map", "0:v", "-map", "1:a?",
+                    *(["-vf", "hqdn3d=0:0:10:12", "-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p"]
+                      if denoise else ["-c:v", "copy"]),
+                    "-c:a", "aac", "-b:a", "160k", "-shortest", out_path], check=True)
     shutil.rmtree(f"{d}/parts_{tag}", ignore_errors=True)
     if not keep_raw:
         shutil.rmtree(f"{d}/{raw}", ignore_errors=True)
@@ -755,7 +761,8 @@ def blend_part(*a, **kw):
 def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, max_frames: int = 0, res: int = 896, href: int = 704,
           max_cost_usd: float = 1.2, seed: int = 42, steps: int = 8, sampler: str = "euler", dry_run: bool = False,
           reuse_raw: str = "", promote_thr: float = 6.0, key_step: int = 2, grain: bool = False, grain_max: float = 2.5, fix_top: bool = True, align_fix: bool = False, align_sigma: float = 4.0, taps: int = 1, seg_mask: bool = True, seg_full: bool = False, output_put_url: str = "", flow_comp: bool = False, soft_match: bool = False, seq_ref: int = 0,
-                gpu_only: bool = False, core: list = None, out_name: str = ""):
+                gpu_only: bool = False, core: list = None, out_name: str = "",
+                post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -1069,6 +1076,28 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
                     roi = res_f[by0:by1, bx0:bx1].astype(np.float32) + (nz * ellg)[..., None]
                     res_f[by0:by1, bx0:bx1] = roi.clip(0, 255).astype(np.uint8)
         final[i] = res_f
+
+    # second temporal pass over the finished frames (also covers interpolated frames): every head is averaged with its
+    # motion-aligned neighbours (+-post_taps); neighbours that do not match (fast motion, occlusion) are rejected per pixel
+    if post_taps:
+        final2 = {}
+        for i in todo:
+            g = _geom(sm[i])
+            box = roi_box(g)
+            bx0, by0, bx1, by1 = box
+            r_ = run_of[i]
+            nbs = [i + o for t_ in range(1, post_taps + 1) for o in (-t_, t_) if (i + o) in final and (i + o) in r_]
+            if not nbs:
+                continue
+            m = CM[i][by0:by1, bx0:bx1, None] if i in CM else _frame_mask(frames[i], g, W, H, **TIGHT)[by0:by1, bx0:bx1]
+            wts = [post_w / abs(k - i) for k in nbs]
+            al = [_aligned(frames[i], frames[k], final[k], box) for k in nbs]
+            base = final[i][by0:by1, bx0:bx1]
+            new = base.astype(np.float32) * (1 - m) + blend_roi(base, al, thr=post_thr, weights=wts) * m
+            f2 = final[i].copy()
+            f2[by0:by1, bx0:bx1] = new.clip(0, 255).astype(np.uint8)
+            final2[i] = f2
+        final.update(final2)
 
     if core:
         out_path = f"{d}/{out_name}"
