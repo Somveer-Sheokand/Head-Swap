@@ -83,7 +83,8 @@ curl "$BASE/jobs/<job_id>"            # -> result.download_url
 
 | Job | Time | Approx. cost |
 |---|---|---|
-| Image (1080x1920), `best` | ~2-2.5 min (mostly cold start) | ~$0.12-0.20 |
+| **Video, 15.5 s (388 frames, 208 with the head), `best`, measured end-to-end via `/swap`** | **17.2 min** (GPU stage 10.2 min on 8 L40S, blend + join 7 min) | **~$2.60** |
+| Image (1080x1920), `best` | ~1 min (mostly cold start + first model load) | ~$0.05-0.10 |
 | Video, 8 s (193 frames), `best` | ~18-22 min | ~$3.5-4.3 |
 | Video, 8 s (193 frames), `fast` | ~12 min (measured) | ~$1.3-1.5 (measured) |
 
@@ -93,6 +94,17 @@ An 8 s `best` video fits under the default `max_cost_usd` of 5; longer videos ne
 Check real usage with `modal billing report --for "this month"`; estimates have been low in the past, so the
 built-in cost check (`max_cost_usd`) now multiplies the per-frame estimate by `EST_FACTOR = 2.0`.
 Use `"dry_run": true` on `/swap` to see the frame count, generation size (`res`) and cost estimate without using a GPU.
+
+### Speed / cost tests (12-frame GPU batch, 1024 px)
+
+| Change | Result | Used |
+|---|---|---|
+| 8 GPU containers per video instead of 4 (`GPU_PARALLEL`), 20 blend containers instead of 12 | GPU stage 837-882 s -> 611 s, same GPU-seconds | **yes** |
+| SageAttention | 9 % slower (194.9 s vs 179.1 s) | no |
+| 6 instead of 8 steps | only 7 % faster (166 s vs 179 s) | no |
+| GPU snapshot | container start-up is only ~10 s | no |
+| steadier crop for generation (`track_sigma=5`) | more wobble (8.08 px / 0.92 % vs 7.25 px / 0.64 %) | no |
+| `"quality": "eco"` (keyframe propagation, RAFT) | 120 of 208 frames generated (-42 % GPU) | optional, calm footage |
 
 ### Optional speed-ups (built in, OFF until tested)
 Two switches at the top of `bfs_service.py`. Each needs one short paid test (an image or a 2-second sample) after

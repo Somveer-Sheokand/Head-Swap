@@ -23,13 +23,20 @@ PRESETS = {
     # adaptive: small / far-away heads are generated at a smaller size (never below MIN_RES) - they are shrunk
     # to their on-screen size anyway, so the extra pixels cost GPU time without being visible
     "fast": dict(res=832, href=640, key_step=2, taps=2, adaptive=True),
+    # eco: same look as best, but BFS heads only on keyframes (every 8th frame + frames where RAFT-warping fails,
+    # ~40-55 % fewer GPU frames); in-between frames carry the key heads along the original motion. Least wobble,
+    # but faint seams can appear in very fast head turns - use for calm footage
+    "eco": dict(res=1024, href=768, key_step=8, prop=True, flow="raft", prop_thr=5.5, prop_gate=12.0, taps=2,
+                post_taps=3, post_w=0.8, post_thr=16.0, denoise=True, stab_iters=2, stab_taps=2, stab_w=0.8, cm_smooth=2.0),
 }
 MIN_RES = 640
 EST_FACTOR = 2.0                     # real Modal bills were ~2x the plain per-frame estimate (cold starts, idle GPU time)
 
-# Speed-ups that are built in but OFF until they have been tested once on a real job (each needs a redeploy):
-USE_SNAPSHOT = False   # Modal memory + GPU snapshot of the loaded ComfyUI -> cold start ~60-110 s -> ~10-20 s
-USE_SAGE = False       # SageAttention in ComfyUI -> ~15-30 % less GPU time per frame
+# Tested and left OFF: SageAttention made a 12-frame batch 9 % SLOWER (194.9 s vs 179.1 s); container start-up is
+# only ~10 s, so a GPU snapshot would save cents. 6 instead of 8 steps saves only 7 % (166 s vs 179 s).
+USE_SNAPSHOT = False
+USE_SAGE = False
+GPU_PARALLEL = 8                     # GPU containers per video (same total GPU-seconds, ~half the wall time of 4)
 BLEND_CHUNK, BLEND_PAD = 24, 10      # frames per parallel blend container, overlap frames each side
 KEEP_DAYS = 14                       # outputs / uploads older than this are deleted automatically
 
@@ -105,7 +112,7 @@ _SNAP_OPTS = dict(enable_memory_snapshot=True, experimental_options={"enable_gpu
 
 
 # no min_containers: the GPU scales to zero 15 s after the last job, so an idle app costs nothing
-@app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=4, **_SNAP_OPTS)
+@app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=GPU_PARALLEL, **_SNAP_OPTS)
 class Worker:
     @modal.enter(snap=USE_SNAPSHOT)
     def boot(self):
@@ -461,7 +468,7 @@ def preprocess(template_id: str, video_url: str, target_face_url: str):
     return {k: v for k, v in meta.items() if k != "track"} | {"seconds": round(time.time() - t0, 1)}
 
 
-def _smooth_track(track, n, max_gap=6):
+def _smooth_track(track, n, max_gap=6, sigma=2.0):
     import numpy as np
     boxes = [t["box"] for t in track]
     # fill short gaps by linear interpolation
@@ -481,8 +488,9 @@ def _smooth_track(track, n, max_gap=6):
         while j < n and out[j] is not None:
             j += 1
         arr = np.array(out[i:j], dtype=float)
-        k = np.exp(-0.5 * (np.arange(-4, 5) / 2.0) ** 2); k /= k.sum()
-        pad = np.pad(arr, ((4, 4), (0, 0)), mode="edge")
+        rad = max(1, int(round(2.0 * sigma)))       # sigma 2 -> +-4 frames (old default); larger = steadier crop
+        k = np.exp(-0.5 * (np.arange(-rad, rad + 1) / sigma) ** 2); k /= k.sum()
+        pad = np.pad(arr, ((rad, rad), (0, 0)), mode="edge")
         sm = np.stack([np.convolve(pad[:, c], k, mode="valid") for c in range(4)], 1)
         for q in range(i, j):
             res[q] = sm[q - i].tolist()
@@ -999,7 +1007,7 @@ def swap2(*a, **kw):
     return _swap2_impl(*a, **kw)
 
 
-@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=8192, timeout=1800, max_containers=12)
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=8192, timeout=1800, max_containers=20)
 def blend_part(*a, **kw):
     """Blends one slice of the video from already generated heads (reuse_raw) - many run in parallel."""
     return _swap2_impl(*a, **kw)
@@ -1011,7 +1019,8 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
                 gpu_only: bool = False, core: list = None, out_name: str = "",
                 post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6,
                 stab_iters: int = 0, stab_taps: int = 2, stab_w: float = 0.8, cm_smooth: float = 0.0,
-                prop: bool = False, flow: str = "farneback", prop_thr: float = 7.0, prop_sc: float = 0.5):
+                prop: bool = False, flow: str = "farneback", prop_thr: float = 7.0, prop_sc: float = 0.5,
+                prop_gate: float = 25.0, track_sigma: float = 2.0):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -1019,7 +1028,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
     meta = json.load(open(f"{d}/track.json"))
     n, fps, W, H = meta["frames"], meta["fps"], meta["w"], meta["h"]
     end = n if not max_frames else min(n, start_frame + max_frames)
-    sm = _smooth_track(meta["track"], n)
+    sm = _smooth_track(meta["track"], n, sigma=track_sigma)
     todo = [i for i in range(start_frame, end) if sm[i] is not None]
     runs, cur = [], []
     for i in todo:
@@ -1121,7 +1130,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
         keys = [k for k in have if k in set(keys)] if prop else have
     keyset = set(keys)
     per = 14.0 * (res / 896) ** 2
-    est = (len(keys) * per + max(1, min(4, round(len(keys) / 40))) * 110) * GPU_USD_PER_SEC * EST_FACTOR
+    est = (len(keys) * per + max(1, min(GPU_PARALLEL, -(-len(keys) // 26))) * 60) * GPU_USD_PER_SEC * EST_FACTOR
     ev = np.array(list(errs.values())) if errs else np.array([0.0])
     info = {"frames_range": [start_frame, end], "head_frames": len(todo), "key_frames": len(keys), "promoted": int(sum(1 for e in errs.values() if e > promote_thr)),
             "interp_err_pctl_50_75_90_max": [round(float(np.percentile(ev, p)), 2) for p in (50, 75, 90)] + [round(float(ev.max()), 2)],
@@ -1172,7 +1181,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
             cv2.imwrite(f"{d}/raw_{tag}/{i:04d}.png", o)
         jobs_vol.commit()
     else:
-        n_gpu = max(1, min(4, round(len(crops) / 40)))
+        n_gpu = max(1, min(GPU_PARALLEL, -(-len(crops) // 26)))   # ~26 frames per GPU container
         size = max(1, min(100, -(-len(crops) // n_gpu)))
         batches = [crops[k:k + size] for k in range(0, len(crops), size)]
         for rs in Worker().process.map(batches, kwargs={"head_png": head_png, "steps": steps, "sampler": sampler, "seed": seed, "res": res, "href": href}):
@@ -1427,7 +1436,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
                 wb = 0.5 if pk == nk else (i - pk) / float(nk - pk)
                 (a, ma), (b, mb) = wr[pk], wr[nk]
                 dab = np.abs(cv2.GaussianBlur(a, (0, 0), 3) - cv2.GaussianBlur(b, (0, 0), 3)).mean(2)[..., None]
-                pick = np.where(dab < 25, (1 - wb) * a + wb * b, a if wb < 0.5 else b)
+                pick = np.where(dab < prop_gate, (1 - wb) * a + wb * b, a if wb < 0.5 else b)
                 m = ((1 - wb) * ma + wb * mb)[..., None]
                 new = o_t[by0:by1, bx0:bx1].astype(np.float32) * (1 - m) + pick * m
                 res_f[by0:by1, bx0:bx1] = new.clip(0, 255).astype(np.uint8)
