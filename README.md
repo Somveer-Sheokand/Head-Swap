@@ -122,6 +122,21 @@ Head flicker = mean |frame - average of its two neighbours| in the head area (lo
 No ghosting was visible in close-up eating shots. The second pass rejects neighbour pixels that do not match
 (fast motion, hands/food in front of the face), so it does not smear.
 
+### Experimental: video-model refine (`refine_video`, not used by default)
+
+`refine_video(template_id, video_name, denoise=0.25, crop_res=1024, crop_scale=0.72)` re-draws the swapped head of a
+finished video with **Wan 2.2 TI2V-5B** (Apache-2.0, video-to-video at low strength, up to 81 frames at once) and pastes
+only the head/hair back. Test on an 81-frame close-up (L40S, ~$0.25 per clip):
+
+| Version | Head flicker | Sharpness |
+|---|---|---|
+| current `best` | 6.53 | 12.2 |
+| Wan refine 0.25 | 5.92 | 8.8 (softer) |
+| Wan refine + `best` fine detail added back | 5.94 | 12.8 |
+
+Flicker drops ~9 %, but the video model changes identity details (eye colour drifted from blue-grey to brown,
+eyebrow shape) and smooths skin, so it is **not** enabled. Models are in `download_models.py`.
+
 ## Known limitations
 
 - Each frame's head is generated independently; in `best` the smoothing passes bring the head flicker to about the

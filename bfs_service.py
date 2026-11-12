@@ -200,6 +200,83 @@ class Worker:
         return results
 
 
+# ----------------------------------------------------------------------------- temporal refiner (Wan 2.2 TI2V-5B, Apache-2.0)
+# BFS generates every frame on its own, so fine hair / skin detail shimmers. The refiner re-draws the swapped head
+# clip with a VIDEO model at low strength (video-to-video): the model sees up to 81 frames at once and makes them
+# consistent, while the low strength keeps the BFS identity.
+WAN_PROMPT = ("a realistic video of a young man with short dark hair, natural skin texture, detailed hair, the same face "
+              "in every frame, steady, sharp focus, natural lighting")
+WAN_NEG = "flicker, jitter, morphing, blurry, distorted face, deformed, artifacts, low quality, cartoon, watermark"
+
+
+def _wan_graph(video_name, seed, steps, cfg, denoise, prompt=WAN_PROMPT, neg=WAN_NEG):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_ti2v_5B_fp16.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "3": {"class_type": "VAELoader", "inputs": {"vae_name": "wan2.2_vae.safetensors"}},
+        "4": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["1", 0], "shift": 8.0}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt}},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": neg}},
+        "7": {"class_type": "LoadVideo", "inputs": {"file": video_name}},
+        "8": {"class_type": "GetVideoComponents", "inputs": {"video": ["7", 0]}},
+        "9": {"class_type": "VAEEncode", "inputs": {"pixels": ["8", 0], "vae": ["3", 0]}},
+        "10": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": "uni_pc",
+                                                      "scheduler": "simple", "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["9", 0],
+                                                      "denoise": denoise}},
+        "11": {"class_type": "VAEDecode", "inputs": {"samples": ["10", 0], "vae": ["3", 0]}},
+        "12": {"class_type": "SaveImage", "inputs": {"images": ["11", 0], "filename_prefix": "wan"}},
+    }
+
+
+@app.cls(image=gpu_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=1800, scaledown_window=15, max_containers=3)
+class RefineWorker:
+    @modal.enter()
+    def boot(self):
+        for sub in ["diffusion_models", "text_encoders", "vae", "loras"]:
+            d = f"/comfy/models/{sub}"
+            subprocess.run(["rm", "-rf", d])
+            os.symlink(f"{MODELS}/{sub}", d)
+        self.proc = subprocess.Popen(["python", "main.py", "--listen", "127.0.0.1", "--port", "8188"], cwd="/comfy",
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(300):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=2)
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            raise RuntimeError("comfy did not start")
+
+    @modal.method()
+    def refine(self, clip_mp4: bytes, denoise: float = 0.3, steps: int = 20, cfg: float = 5.0, seed: int = 42,
+               prompt: str = WAN_PROMPT) -> list:
+        """clip_mp4: head clip (4k+1 frames, side a multiple of 32) -> list of refined PNG frames (same size/order)"""
+        os.makedirs("/comfy/input", exist_ok=True)
+        name = f"clip_{uuid.uuid4().hex[:8]}.mp4"
+        open(f"/comfy/input/{name}", "wb").write(clip_mp4)
+        t0 = time.time()
+        req = urllib.request.Request("http://127.0.0.1:8188/prompt", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"prompt": _wan_graph(name, seed, steps, cfg, denoise, prompt)}).encode())
+        try:
+            pid = json.load(urllib.request.urlopen(req))["prompt_id"]
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(e.read().decode()[:1500])
+        while True:
+            h = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
+            if pid in h:
+                break
+            time.sleep(1)
+        if h[pid]["status"].get("status_str") != "success":
+            raise RuntimeError("comfy failed: " + json.dumps(h[pid]["status"])[:1500])
+        out = []
+        for im in h[pid]["outputs"]["12"]["images"]:
+            q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
+            out.append(urllib.request.urlopen(f"http://127.0.0.1:8188/view?{q}").read())
+        os.remove(f"/comfy/input/{name}")
+        print(f"refined clip of {len(out)} frames in {time.time()-t0:.1f}s", flush=True)
+        return out
+
+
 # ----------------------------------------------------------------------------- CPU helpers
 def _fa():
     from insightface.app import FaceAnalysis
@@ -1199,6 +1276,135 @@ def measure(template_id: str, names: list):
             res[name]["ADDED_scale_jitter_rms_pct"] = round(float(np.sqrt(np.mean(np.square(adds))) * 100), 2) if adds else None
     return res
 
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=24576, timeout=3600)
+def refine_video(template_id: str, video_name: str, denoise: float = 0.3, start_frame: int = 0, max_frames: int = 0,
+                 out_name: str = "", crop_res: int = 704, chunk: int = 81, overlap: int = 16, steps: int = 20, cfg: float = 5.0,
+                 seed: int = 42, prompt: str = WAN_PROMPT, max_cost_usd: float = 3.0, dry_run: bool = False,
+                 crop_scale: float = 1.0):
+    """Temporal refine of a finished swap (video_name inside the template folder) with the Wan video model.
+    Only the head + hair (face-parsing mask) of the refined clip is pasted back, colour-matched to the input."""
+    import cv2, numpy as np
+    t0 = time.time()
+    jobs_vol.reload()
+    d = f"{JOBS}/{template_id}"
+    meta = json.load(open(f"{d}/track.json"))
+    n, fps, W, H = meta["frames"], meta["fps"], meta["w"], meta["h"]
+    end = n if not max_frames else min(n, start_frame + max_frames)
+    sm = _smooth_track(meta["track"], n)
+    runs, cur = [], []
+    for i in range(start_frame, end):
+        if sm[i] is None:
+            continue
+        if cur and i != cur[-1] + 1:
+            runs.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        runs.append(cur)
+    runs = [r for r in runs if len(r) >= 5]
+    # chunks of <= `chunk` frames with `overlap` frames shared between neighbours; padded to 4k+1 frames for the VAE
+    chunks = []
+    for r in runs:
+        s = 0
+        while True:
+            seg = r[s:s + chunk]
+            chunks.append((seg, s > 0, s + chunk < len(r)))
+            if s + chunk >= len(r):
+                break
+            s += chunk - overlap
+    padded = sum(((len(c[0]) - 1 + 3) // 4) * 4 + 1 for c in chunks)
+    est = (padded * 0.9 * (crop_res / 704) ** 2 * (denoise * steps / 6) + len(chunks) * 15 + 120) * GPU_USD_PER_SEC * EST_FACTOR
+    info = {"frames_range": [start_frame, end], "head_frames": sum(len(r) for r in runs), "chunks": len(chunks),
+            "est_cost_usd": round(est, 2)}
+    if dry_run or est > max_cost_usd:
+        return info | {"aborted": not dry_run}
+
+    cap = cv2.VideoCapture(f"{d}/{video_name}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frames = {}
+    for i in range(start_frame, end):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames[i] = fr
+    cap.release()
+    geo, crops = {}, {}
+    for r in runs:
+        for i in r:
+            g = _geom_clamped(sm[i], W, H)
+            g = (g[0], g[1], g[2] * crop_scale) + tuple(g[3:])   # tighter crop = more head pixels for the video model
+            geo[i] = g
+            crops[i] = _crop(frames[i], g[0], g[1], g[2], crop_res)
+
+    def clip_bytes(seg):
+        L2 = ((len(seg) - 1 + 3) // 4) * 4 + 1
+        idx = seg + [seg[-1]] * (L2 - len(seg))
+        tmp = f"/tmp/clip_{uuid.uuid4().hex[:6]}.mp4"
+        p = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{crop_res}x{crop_res}",
+                              "-r", str(fps), "-i", "-", "-c:v", "libx264", "-crf", "8", "-preset", "medium", "-pix_fmt", "yuv444p", tmp],
+                             stdin=subprocess.PIPE)
+        for i in idx:
+            p.stdin.write(crops[i][0].tobytes())
+        p.stdin.close()
+        p.wait()
+        b = open(tmp, "rb").read()
+        os.remove(tmp)
+        return b
+
+    tg = time.time()
+    clips = [clip_bytes(c[0]) for c in chunks]
+    outs = list(RefineWorker().refine.map(clips, kwargs={"denoise": denoise, "steps": steps, "cfg": cfg, "seed": seed, "prompt": prompt}))
+    gpu_wall = time.time() - tg
+
+    acc, wsum = {}, {}
+    for (seg, has_prev, has_next), pngs in zip(chunks, outs):
+        L = len(seg)
+        for pos, i in enumerate(seg):
+            w = 1.0
+            if has_prev:
+                w = min(w, (pos + 1) / (overlap + 1))
+            if has_next:
+                w = min(w, (L - pos) / (overlap + 1))
+            im = cv2.imdecode(np.frombuffer(pngs[pos], np.uint8), cv2.IMREAD_COLOR).astype(np.float32)
+            if im.shape[0] != crop_res:
+                im = cv2.resize(im, (crop_res, crop_res), interpolation=cv2.INTER_CUBIC)
+            acc[i] = acc.get(i, 0) + im * w
+            wsum[i] = wsum.get(i, 0) + w
+
+    sess = _seg_session(False)
+    final = {}
+    for i in acc:
+        ref = (acc[i] / wsum[i]).clip(0, 255).astype(np.uint8)
+        crop, M = crops[i]
+        cx_, cy_, S_, w_, h_, bx, by = geo[i]
+        sc = crop_res / S_
+        capm = _head_mask(crop_res, S_, w_, h_, bx, by, cx_, cy_, ax=1.0, ay=1.25, dy=0.2, fe=0.0) > 0.5
+        fx, fy = crop_res / 2 + sc * (bx - cx_), crop_res / 2 + sc * (by - cy_)
+        m = _head_region(sess, crop, fx, fy, w_ * sc, h_ * sc, capm)
+        m = cv2.GaussianBlur(cv2.dilate(m, np.ones((int(0.012 * crop_res) | 1,) * 2, np.uint8)), (0, 0), 0.008 * crop_res)
+        e_ = np.clip(np.minimum(np.arange(crop_res), np.arange(crop_res)[::-1]) / (0.05 * crop_res), 0, 1).astype(np.float32)
+        m = m * np.minimum(e_[:, None], e_[None, :])          # fade out towards the crop border (tight crops)
+        ring =cv2.dilate(m, np.ones((int(0.06 * crop_res) | 1,) * 2, np.uint8))
+        ref = _color_match(ref, crop, ring)
+        inv = cv2.invertAffineTransform(M)
+        gw = cv2.warpAffine(ref, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        mw = cv2.warpAffine(m, inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)[..., None]
+        final[i] = (frames[i].astype(np.float32) * (1 - mw) + gw * mw).clip(0, 255).astype(np.uint8)
+
+    out_name = out_name or f"refined_{uuid.uuid4().hex[:6]}.mp4"
+    out_path = f"{d}/{out_name}"
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+           "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4", "-map", "0:v", "-map", "1:a?",
+           "-c:v", "libx264", "-crf", "16", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", out_path]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for i in range(start_frame, start_frame + len(frames)):
+        p.stdin.write(final.get(i, frames[i]).tobytes())
+    p.stdin.close()
+    p.wait()
+    jobs_vol.commit()
+    return info | {"output": out_name, "gpu_wall_s": round(gpu_wall, 1), "total_s": round(time.time() - t0, 1), "denoise": denoise}
 
 
 def _put_file(path, url, ctype):

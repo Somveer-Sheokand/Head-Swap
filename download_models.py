@@ -22,6 +22,10 @@ FILES = [
     ("Comfy-Org/Qwen-Image-2.1", "vae/qwen_image_2.1_vae_bf16.safetensors", "vae/qwen_image_2.1_vae_bf16.safetensors"),
     ("Comfy-Org/Qwen-Image-2.1", "loras/p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors", "loras/p_q_image_2.1_8_steps_v0.1_comfyui_bf16.safetensors"),
     ("Alissonerdx/BFS-Best-Face-Swap", "bfs_head_v1.1_qwen_2.1.safetensors", "loras/bfs_head_v1.1_qwen_2.1.safetensors"),
+    # temporal refiner ("ultra" quality): Wan 2.2 TI2V-5B, Apache-2.0
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors", "diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"),
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/vae/wan2.2_vae.safetensors", "vae/wan2.2_vae.safetensors"),
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
 ]
 
 
