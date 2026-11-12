@@ -26,6 +26,12 @@ FILES = [
     ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors", "diffusion_models/wan2.2_ti2v_5B_fp16.safetensors"),
     ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/vae/wan2.2_vae.safetensors", "vae/wan2.2_vae.safetensors"),
     ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors", "text_encoders/umt5_xxl_fp8_e4m3fn_scaled.safetensors"),
+    # video-native head replacement ("animate"): Wan 2.2 Animate 14B (Apache-2.0) + relight LoRA + 4-6 step LoRA
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/diffusion_models/wan2.2_animate_14B_int8_convrot.safetensors", "diffusion_models/wan2.2_animate_14B_int8_convrot.safetensors"),
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/loras/wan2.2_animate_14B_relight_lora_bf16.safetensors", "loras/wan2.2_animate_14B_relight_lora_bf16.safetensors"),
+    ("Kijai/WanVideo_comfy", "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"),
+    ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/vae/wan_2.1_vae.safetensors", "vae/wan_2.1_vae.safetensors"),
+    ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/clip_vision/clip_vision_h.safetensors", "clip_vision/clip_vision_h.safetensors"),
 ]
 
 

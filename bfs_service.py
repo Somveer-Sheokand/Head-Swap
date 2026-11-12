@@ -280,6 +280,106 @@ class RefineWorker:
         return out
 
 
+# ----------------------------------------------------------------------------- video-native head replacement (Wan 2.2 Animate 14B)
+# The head is generated as ONE video (77/81 frames at once) instead of frame by frame, so there is no per-frame
+# randomness to cause jitter. Inputs (all in head-crop space): reference = one BFS-swapped frame (identity, hair, eye
+# colour), face_video = the original performer's face crops (expressions), pose_video = DWPose of the original crop
+# (head/shoulder pose), background_video = original crop with the head blacked out + character_mask = head mask.
+anim_image = gpu_image.run_commands(
+    "cd /comfy/custom_nodes && git clone --depth 1 https://github.com/Fannovel16/comfyui_controlnet_aux",
+    "cd /comfy/custom_nodes/comfyui_controlnet_aux && pip install -r requirements.txt",
+)
+ANIM_NEG = ("色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，"
+            "多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景")
+ANIM_PROMPT = ("the man from the reference image, realistic video, natural skin texture, detailed hair, the same face in every "
+               "frame, natural lighting")
+
+
+def _anim_graph(w, h, length, seed, steps, prompt):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "wan2.2_animate_14B_int8_convrot.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "strength_model": 1.0}},
+        "3": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["2", 0], "lora_name": "wan2.2_animate_14B_relight_lora_bf16.safetensors", "strength_model": 1.0}},
+        "4": {"class_type": "ModelSamplingSD3", "inputs": {"model": ["3", 0], "shift": 8.0}},
+        "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": "umt5_xxl_fp8_e4m3fn_scaled.safetensors", "type": "wan", "device": "default"}},
+        "6": {"class_type": "VAELoader", "inputs": {"vae_name": "wan_2.1_vae.safetensors"}},
+        "7": {"class_type": "CLIPVisionLoader", "inputs": {"clip_name": "clip_vision_h.safetensors"}},
+        "8": {"class_type": "LoadImage", "inputs": {"image": "ref.png"}},
+        "9": {"class_type": "CLIPVisionEncode", "inputs": {"clip_vision": ["7", 0], "image": ["8", 0], "crop": "none"}},
+        "10": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 0], "text": prompt}},
+        "11": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 0], "text": ANIM_NEG}},
+        "12": {"class_type": "LoadVideo", "inputs": {"file": "bg.mp4"}},
+        "13": {"class_type": "GetVideoComponents", "inputs": {"video": ["12", 0]}},
+        "14": {"class_type": "LoadVideo", "inputs": {"file": "face.mp4"}},
+        "15": {"class_type": "GetVideoComponents", "inputs": {"video": ["14", 0]}},
+        "16": {"class_type": "LoadVideo", "inputs": {"file": "orig.mp4"}},
+        "17": {"class_type": "GetVideoComponents", "inputs": {"video": ["16", 0]}},
+        "18": {"class_type": "DWPreprocessor", "inputs": {"image": ["17", 0], "detect_hand": "enable", "detect_body": "enable", "detect_face": "disable",
+                                                          "resolution": 512, "bbox_detector": "yolox_l.onnx",
+                                                          "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt", "scale_stick_for_xinsr_cn": "disable"}},
+        "19": {"class_type": "LoadVideo", "inputs": {"file": "mask.mp4"}},
+        "20": {"class_type": "GetVideoComponents", "inputs": {"video": ["19", 0]}},
+        "21": {"class_type": "ImageToMask", "inputs": {"image": ["20", 0], "channel": "red"}},
+        "22": {"class_type": "WanAnimateToVideo", "inputs": {"positive": ["10", 0], "negative": ["11", 0], "vae": ["6", 0], "width": w, "height": h,
+                                                             "length": length, "batch_size": 1, "clip_vision_output": ["9", 0], "reference_image": ["8", 0],
+                                                             "face_video": ["15", 0], "pose_video": ["18", 0], "background_video": ["13", 0],
+                                                             "character_mask": ["21", 0], "continue_motion_max_frames": 5, "video_frame_offset": 0}},
+        "23": {"class_type": "KSampler", "inputs": {"model": ["4", 0], "seed": seed, "steps": steps, "cfg": 1.0, "sampler_name": "euler",
+                                                      "scheduler": "simple", "positive": ["22", 0], "negative": ["22", 1], "latent_image": ["22", 2],
+                                                      "denoise": 1.0}},
+        "24": {"class_type": "TrimVideoLatent", "inputs": {"samples": ["23", 0], "trim_amount": ["22", 3]}},
+        "25": {"class_type": "VAEDecode", "inputs": {"samples": ["24", 0], "vae": ["6", 0]}},
+        "26": {"class_type": "SaveImage", "inputs": {"images": ["25", 0], "filename_prefix": "anim"}},
+    }
+
+
+@app.cls(image=anim_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=3600, scaledown_window=15, max_containers=3)
+class AnimateWorker:
+    @modal.enter()
+    def boot(self):
+        for sub in ["diffusion_models", "text_encoders", "vae", "loras", "clip_vision"]:
+            d = f"/comfy/models/{sub}"
+            subprocess.run(["rm", "-rf", d])
+            os.symlink(f"{MODELS}/{sub}", d)
+        self.proc = subprocess.Popen(["python", "main.py", "--listen", "127.0.0.1", "--port", "8188"], cwd="/comfy",
+                                     stdout=open("/tmp/comfy.log", "w"), stderr=subprocess.STDOUT)
+        for _ in range(450):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=2)
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            raise RuntimeError("comfy did not start: " + open("/tmp/comfy.log").read()[-3000:])
+
+    @modal.method()
+    def animate(self, files: dict, w: int, h: int, length: int, seed: int = 42, steps: int = 6, prompt: str = ANIM_PROMPT) -> list:
+        """files: {'ref.png','bg.mp4','face.mp4','orig.mp4','mask.mp4'} -> list of PNG frames (length)"""
+        os.makedirs("/comfy/input", exist_ok=True)
+        for k, v in files.items():
+            open(f"/comfy/input/{k}", "wb").write(v)
+        t0 = time.time()
+        req = urllib.request.Request("http://127.0.0.1:8188/prompt", headers={"Content-Type": "application/json"},
+                                     data=json.dumps({"prompt": _anim_graph(w, h, length, seed, steps, prompt)}).encode())
+        try:
+            pid = json.load(urllib.request.urlopen(req))["prompt_id"]
+        except urllib.error.HTTPError as e:
+            raise RuntimeError(e.read().decode()[:3000])
+        while True:
+            hst = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
+            if pid in hst:
+                break
+            time.sleep(2)
+        if hst[pid]["status"].get("status_str") != "success":
+            raise RuntimeError("comfy failed: " + json.dumps(hst[pid]["status"])[:3000] + "\nLOG:" + open("/tmp/comfy.log").read()[-3000:])
+        out = []
+        for im in hst[pid]["outputs"]["26"]["images"]:
+            q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
+            out.append(urllib.request.urlopen(f"http://127.0.0.1:8188/view?{q}").read())
+        print(f"animated {len(out)} frames in {time.time()-t0:.1f}s", flush=True)
+        return out
+
+
 # ----------------------------------------------------------------------------- CPU helpers
 def _fa():
     from insightface.app import FaceAnalysis
@@ -1519,6 +1619,180 @@ def refine_video(template_id: str, video_name: str, denoise: float = 0.3, start_
     p.wait()
     jobs_vol.commit()
     return info | {"output": out_name, "gpu_wall_s": round(gpu_wall, 1), "total_s": round(time.time() - t0, 1), "denoise": denoise}
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=8, memory=32768, timeout=5400)
+def animate_video(template_id: str, bfs_video: str, start_frame: int = 0, max_frames: int = 0, out_name: str = "",
+                  crop_res: int = 832, crop_scale: float = 0.8, chunk: int = 77, overlap: int = 12, steps: int = 6, seed: int = 42,
+                  prompt: str = ANIM_PROMPT, face_src: str = "bfs", pose_src: str = "orig"):
+    """Video-native head replacement with Wan 2.2 Animate, guided by a finished BFS swap (bfs_video, same template):
+    one BFS frame is the identity reference, the original footage drives pose + expression. Output = original video
+    with the generated head pasted back (face-parsing mask, colour-matched)."""
+    import cv2, numpy as np
+    t0 = time.time()
+    jobs_vol.reload()
+    d = f"{JOBS}/{template_id}"
+    meta = json.load(open(f"{d}/track.json"))
+    n, fps, W, H = meta["frames"], meta["fps"], meta["w"], meta["h"]
+    end = n if not max_frames else min(n, start_frame + max_frames)
+    sm = _smooth_track(meta["track"], n)
+
+    def read(name):
+        cap = cv2.VideoCapture(f"{d}/{name}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        fr = {}
+        for i in range(start_frame, end):
+            ok, f = cap.read()
+            if not ok:
+                break
+            fr[i] = f
+        cap.release()
+        return fr
+
+    orig, bfs = read("video.mp4"), read(bfs_video)
+    runs, cur = [], []
+    for i in range(start_frame, end):
+        if sm[i] is None or i not in orig:
+            continue
+        if cur and i != cur[-1] + 1:
+            runs.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        runs.append(cur)
+    runs = [r for r in runs if len(r) >= 5]
+    sess = _seg_session(False)
+    fa = _fa()
+    R = crop_res
+    geo, oc, bc, hm = {}, {}, {}, {}
+    for r in runs:
+        for i in r:
+            g = _geom_clamped(sm[i], W, H)
+            g = (g[0], g[1], g[2] * crop_scale) + tuple(g[3:])
+            geo[i] = g
+            oc[i] = _crop(orig[i], g[0], g[1], g[2], R)
+            bc[i] = _crop(bfs[i], g[0], g[1], g[2], R)[0]
+            cx_, cy_, S_, w_, h_, bx, by = g
+            sc = R / S_
+            capm = _head_mask(R, S_, w_, h_, bx, by, cx_, cy_, ax=1.0, ay=1.25, dy=0.2, fe=0.0) > 0.5
+            fx, fy = R / 2 + sc * (bx - cx_), R / 2 + sc * (by - cy_)
+            mo = _head_region(sess, oc[i][0], fx, fy, w_ * sc, h_ * sc, capm)
+            mb = _head_region(sess, bc[i], fx, fy, w_ * sc, h_ * sc, capm)
+            hm[i] = np.maximum(mo, mb)
+
+    # identity reference: the most frontal, confidently detected BFS head in the range
+    best, ref_i = -9.0, None
+    for r in runs:
+        for i in r[::3]:
+            fl = fa.get(bc[i])
+            if not fl:
+                continue
+            f = max(fl, key=lambda q: (q.bbox[2] - q.bbox[0]) * (q.bbox[3] - q.bbox[1]))
+            k = f.kps
+            ed = float(np.hypot(*(k[1] - k[0]))) + 1e-3
+            s = float(f.det_score) - abs(float(k[2][0] - (k[0][0] + k[1][0]) / 2)) / ed + 0.3 * min(1.0, ed / (0.12 * R))
+            if s > best:
+                best, ref_i = s, i
+    if ref_i is None:
+        raise RuntimeError("no usable reference frame")
+    ref_png = cv2.imencode(".png", bc[ref_i])[1].tobytes()
+
+    def enc(imgs, size, gray=False):
+        tmp = f"/tmp/v_{uuid.uuid4().hex[:6]}.mp4"
+        p = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{size}x{size}", "-r", str(fps),
+                              "-i", "-", "-c:v", "libx264", "-crf", "6", "-preset", "medium", "-pix_fmt", "yuv444p", tmp], stdin=subprocess.PIPE)
+        for im in imgs:
+            p.stdin.write(im.tobytes())
+        p.stdin.close()
+        p.wait()
+        b = open(tmp, "rb").read()
+        os.remove(tmp)
+        return b
+
+    jobs = []
+    for r in runs:
+        s = 0
+        while True:
+            seg = r[s:s + chunk]
+            jobs.append((seg, s > 0, s + chunk < len(r)))
+            if s + chunk >= len(r):
+                break
+            s += chunk - overlap
+    payloads = []
+    for seg, _, _ in jobs:
+        L2 = ((len(seg) - 1 + 3) // 4) * 4 + 1
+        idx = seg + [seg[-1]] * (L2 - len(seg))
+        kd = int(0.03 * R) | 1
+        bg, msk, face, og = [], [], [], []
+        for i in idx:
+            m = cv2.dilate(hm[i], np.ones((kd, kd), np.uint8)) > 0.4
+            b = oc[i][0].copy()
+            b[m] = 0
+            bg.append(b)
+            msk.append(np.repeat((m * 255).astype(np.uint8)[..., None], 3, 2))
+            og.append(bc[i] if pose_src == "bfs" else oc[i][0])
+            rb = meta["track"][i]["box"] or sm[i]
+            fcx, fcy, fs_ = (rb[0] + rb[2]) / 2, (rb[1] + rb[3]) / 2, 1.4 * max(rb[2] - rb[0], rb[3] - rb[1])
+            # expressions: from the BFS swap by default - the face crops leak identity into the result, so they
+            # must already show the new person (the original performer's crops made the head look like him)
+            face.append(_crop((bfs if face_src == "bfs" else orig)[i], fcx, fcy, fs_, 512)[0])
+        payloads.append(({"ref.png": ref_png, "bg.mp4": enc(bg, R), "mask.mp4": enc(msk, R), "orig.mp4": enc(og, R),
+                          "face.mp4": enc(face, 512)}, L2))
+    tg = time.time()
+    calls = [AnimateWorker().animate.spawn(pl, R, R, L2, seed, steps, prompt) for pl, L2 in payloads]
+    outs = [c.get() for c in calls]
+    gpu_wall = time.time() - tg
+
+    acc, wsum = {}, {}
+    for (seg, has_prev, has_next), pngs in zip(jobs, outs):
+        L = len(seg)
+        for pos, i in enumerate(seg):
+            if pos >= len(pngs):
+                break
+            w = 1.0
+            if has_prev:
+                w = min(w, (pos + 1) / (overlap + 1))
+            if has_next:
+                w = min(w, (L - pos) / (overlap + 1))
+            im = cv2.imdecode(np.frombuffer(pngs[pos], np.uint8), cv2.IMREAD_COLOR).astype(np.float32)
+            if im.shape[0] != R:
+                im = cv2.resize(im, (R, R), interpolation=cv2.INTER_CUBIC)
+            acc[i] = acc.get(i, 0) + im * w
+            wsum[i] = wsum.get(i, 0) + w
+
+    final = {}
+    for i in acc:
+        gen = (acc[i] / wsum[i]).clip(0, 255).astype(np.uint8)
+        crop, M = oc[i]
+        cx_, cy_, S_, w_, h_, bx, by = geo[i]
+        sc = R / S_
+        capm = _head_mask(R, S_, w_, h_, bx, by, cx_, cy_, ax=1.0, ay=1.25, dy=0.2, fe=0.0) > 0.5
+        fx, fy = R / 2 + sc * (bx - cx_), R / 2 + sc * (by - cy_)
+        mg = _head_region(sess, gen, fx, fy, w_ * sc, h_ * sc, capm)
+        u = np.maximum(hm[i], mg)
+        u = cv2.dilate(u, np.ones((int(0.012 * R) | 1,) * 2, np.uint8))
+        m = cv2.GaussianBlur(u, (0, 0), 0.007 * R)
+        e_ = np.clip(np.minimum(np.arange(R), np.arange(R)[::-1]) / (0.05 * R), 0, 1).astype(np.float32)
+        m = m * np.minimum(e_[:, None], e_[None, :])
+        ring = cv2.dilate(u, np.ones((int(0.06 * R) | 1,) * 2, np.uint8))
+        gen = _color_match(gen, crop, ring)
+        inv = cv2.invertAffineTransform(M)
+        gw = cv2.warpAffine(gen, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        mw = cv2.warpAffine(m, inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)[..., None]
+        final[i] = (orig[i].astype(np.float32) * (1 - mw) + gw * mw).clip(0, 255).astype(np.uint8)
+
+    out_name = out_name or f"animate_{uuid.uuid4().hex[:6]}.mp4"
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+           "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4", "-map", "0:v", "-map", "1:a?",
+           "-c:v", "libx264", "-crf", "14", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", f"{d}/{out_name}"]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for i in range(start_frame, start_frame + len(orig)):
+        p.stdin.write(final.get(i, orig[i]).tobytes())
+    p.stdin.close()
+    p.wait()
+    jobs_vol.commit()
+    return {"output": out_name, "chunks": len(jobs), "ref_frame": ref_i, "head_frames": len(final), "gpu_wall_s": round(gpu_wall, 1),
+            "total_s": round(time.time() - t0, 1)}
 
 
 ARCFACE_128 = [[0.36167656, 0.40387734], [0.63696719, 0.40235469], [0.50019687, 0.56044219], [0.38710391, 0.72160547], [0.61507734, 0.72034453]]

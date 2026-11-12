@@ -153,6 +153,20 @@ only the head/hair back. Test on an 81-frame close-up (L40S, ~$0.25 per clip):
 Flicker drops ~9 %, but the video model changes identity details (eye colour drifted from blue-grey to brown,
 eyebrow shape) and smooths skin, so it is **not** enabled. Models are in `download_models.py`.
 
+### Experimental: video-native head replacement (`animate_video`, Wan 2.2 Animate 14B, not used by default)
+
+Head generated as one video (up to 77-81 frames) in head-crop space: reference = most frontal BFS frame,
+face_video = face crops (expressions), pose_video = DWPose (comfyui_controlnet_aux), background = crop with the head
+blacked out + head mask. Apache-2.0 model; ~7.5 min L40S per 81 frames (~$0.25). Close-up test:
+
+| Version | Head flicker | Added shift / scale (dense flow) | Sharpness | Likeness |
+|---|---|---|---|---|
+| `best` (BFS + smoothing + stabiliser) | 6.24 | 11.45 px / 0.63 % | 11.4 | actor |
+| Animate, face crops from original | 6.78 | 5.80 px / 0.48 % | 16.8 | **original man** |
+| Animate, face crops from BFS | 6.80 | 6.87 px / 0.45 % | - | **still mostly the original man**, stronger expressions |
+
+Much less wobble and sharper, but the identity of the reference is not kept, so it is not enabled.
+
 ### Experimental: HyperSwap face swap (`hyperswap_video`, not used by default)
 
 FaceFusion `hyperswap_1a_256` (ONNX, CPU, **licence ResearchRAIL - research use**), with smoothed 5-point landmarks,
