@@ -56,7 +56,8 @@ cpu_image = (
                   "a.prepare(ctx_id=-1, det_size=(640,640))\"")
 )
 
-cpu_image = cpu_image.run_commands(
+cpu_image = cpu_image.pip_install("torch==2.5.1", "torchvision==0.20.1", index_url="https://download.pytorch.org/whl/cpu").run_commands(
+    "python -c \"from torchvision.models.optical_flow import raft_large, Raft_Large_Weights; raft_large(weights=Raft_Large_Weights.DEFAULT)\"",
     "mkdir -p /seg",
     "python -c \"import urllib.request as u; b='https://huggingface.co/jonathandinu/face-parsing/resolve/main/onnx/'; [u.urlretrieve(b+f, '/seg/'+f) for f in ('model_quantized.onnx','model.onnx')]\"",
 )
@@ -910,6 +911,45 @@ def _aligned(o_t, o_n, s_n, box, sc=0.5):
     return cv2.remap(s_n[y0:y1, x0:x1], gx + fl[..., 0], gy + fl[..., 1], cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
 
 
+_RAFT = {}
+
+
+def _raft_flow(a_bgr, b_bgr):
+    """dense flow a -> b (a(p) ~ b(p + f)) with RAFT-large (torchvision, BSD) on CPU; much more accurate than
+    Farneback for large motion / long frame gaps"""
+    import numpy as np, torch
+    import torch.nn.functional as F
+    from torchvision.models.optical_flow import raft_large, Raft_Large_Weights
+    if "m" not in _RAFT:
+        torch.set_num_threads(max(1, os.cpu_count() or 4))
+        _RAFT["m"] = raft_large(weights=Raft_Large_Weights.DEFAULT).eval()
+    h, w = a_bgr.shape[:2]
+    H8, W8 = (h + 7) // 8 * 8, (w + 7) // 8 * 8
+
+    def prep(x):
+        t = torch.from_numpy(np.ascontiguousarray(x[..., ::-1])).permute(2, 0, 1).float()[None] / 127.5 - 1.0
+        return F.pad(t, (0, W8 - w, 0, H8 - h), mode="replicate")
+    with torch.no_grad():
+        fl = _RAFT["m"](prep(a_bgr), prep(b_bgr), num_flow_updates=12)[-1][0]
+    return fl[:, :h, :w].permute(1, 2, 0).numpy()
+
+
+def _flow_maps(o_t, o_n, box, sc=0.5, method="farneback"):
+    """remap grids that pull pixels of frame n onto frame t inside box (ROI coordinates)"""
+    import cv2, numpy as np
+    x0, y0, x1, y1 = box
+    a = cv2.resize(o_t[y0:y1, x0:x1], None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    b = cv2.resize(o_n[y0:y1, x0:x1], None, fx=sc, fy=sc, interpolation=cv2.INTER_AREA)
+    if method == "raft":
+        fl = _raft_flow(a, b)
+    else:
+        fl = cv2.calcOpticalFlowFarneback(cv2.cvtColor(a, cv2.COLOR_BGR2GRAY), cv2.cvtColor(b, cv2.COLOR_BGR2GRAY),
+                                          None, 0.5, 3, 21, 3, 5, 1.1, 0)
+    fl = cv2.resize(fl, (x1 - x0, y1 - y0)) / sc
+    gx, gy = np.meshgrid(np.arange(x1 - x0, dtype=np.float32), np.arange(y1 - y0, dtype=np.float32))
+    return (gx + fl[..., 0]).astype(np.float32), (gy + fl[..., 1]).astype(np.float32)
+
+
 
 HEAD_CLASSES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 17]   # skin..lips, hair, hat, earring, neck (not cloth)
 _SEG = {}
@@ -970,7 +1010,8 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
           reuse_raw: str = "", promote_thr: float = 6.0, key_step: int = 2, grain: bool = False, grain_max: float = 2.5, fix_top: bool = True, align_fix: bool = False, align_sigma: float = 4.0, taps: int = 1, seg_mask: bool = True, seg_full: bool = False, output_put_url: str = "", flow_comp: bool = False, soft_match: bool = False, seq_ref: int = 0,
                 gpu_only: bool = False, core: list = None, out_name: str = "",
                 post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6,
-                stab_iters: int = 0, stab_taps: int = 2, stab_w: float = 0.8, cm_smooth: float = 0.0):
+                stab_iters: int = 0, stab_taps: int = 2, stab_w: float = 0.8, cm_smooth: float = 0.0,
+                prop: bool = False, flow: str = "farneback", prop_thr: float = 7.0, prop_sc: float = 0.5):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -1015,7 +1056,47 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
 
     # key frames: every key_step-th frame, plus any frame where motion-aligned interpolation would NOT reproduce the real footage
     keys, errs = [], {}
-    for r in runs:
+    FM = {}
+
+    def fmaps(t_, k_, box_):
+        if (t_, k_) not in FM:
+            FM[(t_, k_)] = _flow_maps(frames[t_], frames[k_], box_, prop_sc, flow)
+        return FM[(t_, k_)]
+
+    if prop:
+        # keyframe propagation: BFS heads only on a fixed absolute grid (identical in every parallel slice) + the
+        # real start/end of each shot; frames in between are carried from the nearest keys by the original footage's
+        # motion. A frame becomes a key itself when warping the ORIGINAL key frame onto it does not reproduce it
+        # (mouth opening, eyes closing, occlusion, fast turns) - checked sequentially, so later frames use it.
+        for r in runs:
+            ks = {i for i in r if i % key_step == 0}
+            if r[0] == 0 or sm[r[0] - 1] is None:
+                ks.add(r[0])
+            if r[-1] == n - 1 or sm[r[-1] + 1] is None:
+                ks.add(r[-1])
+            if not ks:
+                ks.add(r[len(r) // 2])
+            for i in r:
+                if i in ks:
+                    continue
+                pk = max(k for k in ks if k < i) if any(k < i for k in ks) else None
+                nk = min(k for k in ks if k > i) if any(k > i for k in ks) else None
+                g = _geom(sm[i]); box = roi_box(g); bx0, by0, bx1, by1 = box
+                ell = _frame_mask(frames[i], g, W, H, ax=1.0, ay=1.25, dy=0.2, fe=0.1)[by0:by1, bx0:bx1, 0]
+                o_roi = cv2.GaussianBlur(frames[i][by0:by1, bx0:bx1], (0, 0), 2).astype(np.float32)
+                e = 0.0
+                for k in (pk, nk):
+                    if k is None:
+                        continue
+                    mx, my = fmaps(i, k, box)
+                    w_ = cv2.remap(frames[k][by0:by1, bx0:bx1], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+                    dif = np.abs(cv2.GaussianBlur(w_, (0, 0), 2).astype(np.float32) - o_roi).mean(2)
+                    e = max(e, float((dif * ell).sum() / (ell.sum() + 1e-6)))
+                errs[i] = e
+                if e > prop_thr:
+                    ks.add(i)
+            keys += sorted(ks)
+    for r in ([] if prop else runs):
         ks = set(r[0::key_step]) | {r[-1]}
         for i in r:
             if i in ks:
@@ -1036,7 +1117,8 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
                 ks.add(i)
         keys += sorted(ks)
     if reuse_raw:
-        keys = sorted(k for k in (int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png")) if k in frames and sm[k] is not None)
+        have = sorted(k for k in (int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png")) if k in frames and sm[k] is not None)
+        keys = [k for k in have if k in set(keys)] if prop else have
     keyset = set(keys)
     per = 14.0 * (res / 896) ** 2
     est = (len(keys) * per + max(1, min(4, round(len(keys) / 40))) * 110) * GPU_USD_PER_SEC * EST_FACTOR
@@ -1335,6 +1417,22 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
             nk = min([k for k in ksr if k > i], default=None)
             if pk is None or nk is None:
                 pk = nk = (pk if pk is not None else nk)
+            if prop:
+                # carry the full head (and its mask, so hair is included) from both keys with the original motion
+                wr = {}
+                for k in {pk, nk}:
+                    mx, my = fmaps(i, k, box)
+                    wr[k] = (cv2.remap(Kc[k][by0:by1, bx0:bx1], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32),
+                             cv2.remap(CM[k][by0:by1, bx0:bx1], mx, my, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0))
+                wb = 0.5 if pk == nk else (i - pk) / float(nk - pk)
+                (a, ma), (b, mb) = wr[pk], wr[nk]
+                dab = np.abs(cv2.GaussianBlur(a, (0, 0), 3) - cv2.GaussianBlur(b, (0, 0), 3)).mean(2)[..., None]
+                pick = np.where(dab < 25, (1 - wb) * a + wb * b, a if wb < 0.5 else b)
+                m = ((1 - wb) * ma + wb * mb)[..., None]
+                new = o_t[by0:by1, bx0:bx1].astype(np.float32) * (1 - m) + pick * m
+                res_f[by0:by1, bx0:bx1] = new.clip(0, 255).astype(np.uint8)
+                final[i] = res_f
+                continue
             a = _aligned(o_t, frames[pk], Kc[pk], box)
             b = _aligned(o_t, frames[nk], Kc[nk], box)
             m = (ell)[..., None]

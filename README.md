@@ -153,6 +153,20 @@ only the head/hair back. Test on an 81-frame close-up (L40S, ~$0.25 per clip):
 Flicker drops ~9 %, but the video model changes identity details (eye colour drifted from blue-grey to brown,
 eyebrow shape) and smooths skin, so it is **not** enabled. Models are in `download_models.py`.
 
+### Optional: keyframe propagation (`prop=True, flow="raft"`, not default)
+
+BFS heads only on an absolute keyframe grid (`key_step`) plus frames where warping the original key frame with RAFT
+optical flow (torchvision, BSD) does not reproduce the footage; frames in between carry the key heads + masks along
+the original motion. Same ad, same heads:
+
+| Version | Head flicker | Added shift (p90) / scale | Notes |
+|---|---|---|---|
+| `best` (v4) | 6.70 | 7.25 px (12.3) / 0.64 % | default |
+| keys every 4th frame | 6.99 | 8.08 px (13.5) / 0.78 % | warping errors in a fast side-profile turn |
+| keys every 8th frame | 6.85 | **6.70 px (9.9) / 0.44 %** | least wobble, but faint seams on the forehead in fast motion |
+
+With `prop` only the key frames need the GPU, so it is also a way to cut GPU cost (~50-85 % fewer generated frames).
+
 ### Experimental: video-native head replacement (`animate_video`, Wan 2.2 Animate 14B, not used by default)
 
 Head generated as one video (up to 77-81 frames) in head-crop space: reference = most frontal BFS frame,
