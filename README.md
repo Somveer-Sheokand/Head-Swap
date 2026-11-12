@@ -105,6 +105,14 @@ Use `"dry_run": true` on `/swap` to see the frame count, generation size (`res`)
 | GPU snapshot | container start-up is only ~10 s | no |
 | steadier crop for generation (`track_sigma=5`) | more wobble (8.08 px / 0.92 % vs 7.25 px / 0.64 %) | no |
 | `"quality": "eco"` (keyframe propagation, RAFT) | 120 of 208 frames generated (-42 % GPU) | optional, calm footage |
+| generate at 896 px, output 1024 (`gen_res=896`) | only 12 % faster (157.8 s vs 179.1 s), head 30 % less sharp | no |
+| Wan2.1 2x-upscale VAE decode (from the user workflow) | incompatible: Qwen Image 2.1 latents have 64 channels, that VAE 16 | no |
+
+### User-supplied ComfyUI workflow (`userflow_video`, deployed, not used by the API)
+Qwen-Image-Edit-2509 + Lightning + InstantX depth ControlNet + inpaint (denoise 0.7) + Wan2.1 2x VAE + SeedVR2 7B,
+Gemini captions replaced by one fixed prompt. 81-frame close-up: sharper (17.0 vs 11.3) but wrong expressions (mouth
+closed while laughing, eyes open while closed), keeps the original hairstyle, more flicker (7.83 vs 6.23) and
+~3x the cost ($2.90 for 81 frames). BFS `best` stays the default.
 
 ### Optional speed-ups (built in, OFF until tested)
 Two switches at the top of `bfs_service.py`. Each needs one short paid test (an image or a 2-second sample) after

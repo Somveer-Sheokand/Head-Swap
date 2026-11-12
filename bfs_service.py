@@ -80,7 +80,7 @@ BODY_RES, HEAD_RES = 768, 640
 PROMPT3 = PROMPT + (". <image3> is the previous video frame already swapped: keep the new head looking exactly as in <image3> (same skin texture, hair strands, lighting and sharpness), only adapting the pose and expression from <image1>")
 
 
-def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES, prev=None):
+def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES, prev=None, vae_up=False, out_res=0):
     g = {
         "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"}},
         "2": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen3vl_8b_int8_convrot.safetensors", "type": "qwen_image", "device": "default"}},
@@ -100,6 +100,12 @@ def _graph(body, head, seed, steps, sampler, res=BODY_RES, href=HEAD_RES, prev=N
         "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["3", 0]}},
         "15": {"class_type": "SaveImage", "inputs": {"images": ["14", 0], "filename_prefix": "out"}},
     }
+    # NOTE: the Wan2.1 2x-upscale VAE from the user workflow cannot be used here - Qwen Image 2.1 latents have 64
+    # channels, that VAE (and Qwen-Image-Edit / Wan2.1) uses 16 (checked in the safetensors headers)
+    if out_res and out_res != res:
+        o = out_res or res
+        g["31"] = {"class_type": "ImageScale", "inputs": {"image": ["14", 0], "upscale_method": "lanczos", "width": o, "height": o, "crop": "disabled"}}
+        g["15"]["inputs"]["images"] = ["31", 0]
     if prev:
         g["16"] = {"class_type": "LoadImage", "inputs": {"image": prev}}
         g["17"] = {"class_type": "ImageScale", "inputs": {"image": ["16", 0], "upscale_method": "lanczos", "width": res, "height": res, "crop": "disabled"}}
@@ -185,7 +191,8 @@ class Worker:
         return results
 
     @modal.method()
-    def process(self, batch: list, head_png: bytes, steps: int = 8, sampler: str = "euler", seed: int = 42, res: int = BODY_RES, href: int = HEAD_RES):
+    def process(self, batch: list, head_png: bytes, steps: int = 8, sampler: str = "euler", seed: int = 42, res: int = BODY_RES, href: int = HEAD_RES,
+                vae_up: bool = False, out_res: int = 0):
         """batch: [(idx, crop_png_bytes)] -> [(idx, out_png_bytes)]"""
         os.makedirs("/comfy/input", exist_ok=True)
         hname = f"head_{uuid.uuid4().hex[:8]}.png"
@@ -195,7 +202,7 @@ class Worker:
         for idx, b in batch:
             bname = f"b_{uuid.uuid4().hex[:8]}.png"
             open(f"/comfy/input/{bname}", "wb").write(b)
-            pid = self._post({"prompt": _graph(bname, hname, seed, steps, sampler, res, href)})["prompt_id"]
+            pid = self._post({"prompt": _graph(bname, hname, seed, steps, sampler, res, href, vae_up=vae_up, out_res=out_res)})["prompt_id"]
             while True:
                 h = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
                 if pid in h:
@@ -385,6 +392,116 @@ class AnimateWorker:
             q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
             out.append(urllib.request.urlopen(f"http://127.0.0.1:8188/view?{q}").read())
         print(f"animated {len(out)} frames in {time.time()-t0:.1f}s", flush=True)
+        return out
+
+
+# ----------------------------------------------------------------------------- user workflow ("qwen edit inpaint")
+# Port of the ComfyUI workflow the user supplied: Qwen-Image-Edit-2509 fp8 + Lightning 4-step V2, inpainting
+# (InpaintModelConditioning + DifferentialDiffusion, denoise 0.7) inside a grown/blurred head mask, InstantX
+# ControlNet Union on a DepthAnythingV2 map (0.9, end 0.8), ClownsharKSampler res_2s / sigmoid_offset 4 steps,
+# Wan2.1 2x-upscale VAE decode -> 0.5x, then SeedVR2 7B upscale blended 50/50 with a lanczos 2x upscale.
+# Changes for video: Gemini captions replaced by ONE fixed prompt (no external API, no per-frame prompt changes),
+# fixed seeds, the person is tracked and processed in a head crop, result pasted back with the same mask.
+# Custom nodes pinned to the commits the workflow was saved with.
+user_image = anim_image.run_commands(
+    "cd /comfy/custom_nodes && git clone https://github.com/ClownsharkBatwing/RES4LYF && cd RES4LYF && git checkout 46de917234f9fef3f2ab411c41e07aa3c633f4f7 && pip install -r requirements.txt",
+    "cd /comfy/custom_nodes && git clone https://github.com/spacepxl/ComfyUI-VAE-Utils",
+    "cd /comfy/custom_nodes && git clone https://github.com/numz/ComfyUI-SeedVR2_VideoUpscaler && cd ComfyUI-SeedVR2_VideoUpscaler && git checkout 984f9af478cbde993c36f1006625753498d2c08d && pip install -r requirements.txt",
+    # the unpinned torchaudio in the base image does not match torch 2.8 (undefined symbol) and breaks diffusers,
+    # which SeedVR2 imports; nothing here needs audio
+    "pip uninstall -y torchaudio",
+)
+USER_PROMPT = ("A young man eating a burger in a fast-food restaurant, photorealistic, natural indoor lighting. "
+               "A man with fair skin, short dark brown textured hair swept up, and light blue-grey eyes.")
+
+
+def _user_graph(seed, prompt, up_res):
+    return {
+        "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "qwen_image_edit_2509_fp8_e4m3fn.safetensors", "weight_dtype": "default"}},
+        "2": {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0], "lora_name": "Qwen-Image-Lightning-4steps-V2.0.safetensors", "strength_model": 1.0}},
+        "3": {"class_type": "DifferentialDiffusion", "inputs": {"model": ["2", 0]}},
+        "4": {"class_type": "ModelSamplingAuraFlow", "inputs": {"model": ["3", 0], "shift": 2.0}},
+        "5": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"}},
+        "6": {"class_type": "VAELoader", "inputs": {"vae_name": "qwen_image_vae.safetensors"}},
+        "7": {"class_type": "VAEUtils_CustomVAELoader", "inputs": {"vae_name": "Wan2.1_VAE_upscale2x_imageonly_real_v1.safetensors", "disable_offload": True, "precision": "auto"}},
+        "8": {"class_type": "LoadImage", "inputs": {"image": "target.png"}},
+        "9": {"class_type": "LoadImage", "inputs": {"image": "mask.png"}},
+        "10": {"class_type": "ImageToMask", "inputs": {"image": ["9", 0], "channel": "red"}},
+        "11": {"class_type": "LoadImage", "inputs": {"image": "source.png"}},
+        "12": {"class_type": "TextEncodeQwenImageEditPlus", "inputs": {"clip": ["5", 0], "prompt": prompt, "vae": ["6", 0], "image1": ["11", 0]}},
+        "13": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["12", 0]}},
+        "14": {"class_type": "InpaintModelConditioning", "inputs": {"positive": ["12", 0], "negative": ["13", 0], "vae": ["6", 0],
+                                                                    "pixels": ["8", 0], "mask": ["10", 0], "noise_mask": True}},
+        "15": {"class_type": "ImageScaleToTotalPixels", "inputs": {"image": ["8", 0], "upscale_method": "nearest-exact", "megapixels": 0.24, "resolution_steps": 1}},
+        "16": {"class_type": "DepthAnythingV2Preprocessor", "inputs": {"image": ["15", 0], "ckpt_name": "depth_anything_v2_vitl.pth", "resolution": 512}},
+        "17": {"class_type": "ControlNetLoader", "inputs": {"control_net_name": "Qwen-Image-InstantX-ControlNet-Union.safetensors"}},
+        "18": {"class_type": "ControlNetApplyAdvanced", "inputs": {"positive": ["14", 0], "negative": ["14", 1], "control_net": ["17", 0],
+                                                                   "image": ["16", 0], "vae": ["6", 0], "strength": 0.9, "start_percent": 0.0, "end_percent": 0.8}},
+        "19": {"class_type": "ClownsharKSampler_Beta", "inputs": {"model": ["4", 0], "positive": ["18", 0], "negative": ["18", 1], "latent_image": ["14", 2],
+                                                                  "eta": 0.5, "sampler_name": "exponential/res_2s", "scheduler": "bong_tangent", "steps": 4,
+                                                                  "steps_to_run": -1, "denoise": 0.7, "cfg": 1.0, "seed": seed, "sampler_mode": "standard",
+                                                                  "bongmath": False}},
+        "20": {"class_type": "VAEUtils_VAEDecodeTiled", "inputs": {"samples": ["19", 0], "vae": ["7", 0], "upscale": -1, "tile": False, "tile_size": 512,
+                                                                   "overlap": 64, "temporal_size": 4096, "temporal_overlap": 64}},
+        "21": {"class_type": "ImageScaleBy", "inputs": {"image": ["20", 0], "upscale_method": "lanczos", "scale_by": 0.5}},
+        "22": {"class_type": "SeedVR2ExtraArgs", "inputs": {"tiled_vae": True, "vae_tile_size": 928, "vae_tile_overlap": 256, "preserve_vram": True,
+                                                            "cache_model": True, "enable_debug": False, "device": "cuda:0"}},
+        "23": {"class_type": "SeedVR2", "inputs": {"images": ["21", 0], "model": "seedvr2_ema_7b_fp16.safetensors", "seed": seed, "new_resolution": up_res,
+                                                   "batch_size": 5, "color_correction": "wavelet", "input_noise_scale": 0.0, "latent_noise_scale": 0.0,
+                                                   "extra_args": ["22", 0]}},
+        "24": {"class_type": "ImageScaleBy", "inputs": {"image": ["21", 0], "upscale_method": "lanczos", "scale_by": 2.0}},
+        "25": {"class_type": "ImageBlend", "inputs": {"image1": ["24", 0], "image2": ["23", 0], "blend_factor": 0.5, "blend_mode": "normal"}},
+        "26": {"class_type": "SaveImage", "inputs": {"images": ["25", 0], "filename_prefix": "uf"}},
+    }
+
+
+@app.cls(image=user_image, gpu="L40S", volumes={MODELS: models_vol}, timeout=3600, scaledown_window=15, max_containers=GPU_PARALLEL)
+class UserFlowWorker:
+    @modal.enter()
+    def boot(self):
+        for sub in ["diffusion_models", "text_encoders", "vae", "loras", "controlnet", "SEEDVR2"]:
+            d = f"/comfy/models/{sub}"
+            subprocess.run(["rm", "-rf", d])
+            os.symlink(f"{MODELS}/{sub}", d)
+        self.proc = subprocess.Popen(["python", "main.py", "--listen", "127.0.0.1", "--port", "8188"], cwd="/comfy",
+                                     stdout=open("/tmp/comfy.log", "w"), stderr=subprocess.STDOUT)
+        for _ in range(450):
+            try:
+                urllib.request.urlopen("http://127.0.0.1:8188/system_stats", timeout=2)
+                break
+            except Exception:
+                time.sleep(2)
+        else:
+            raise RuntimeError("comfy did not start: " + open("/tmp/comfy.log").read()[-3000:])
+
+    @modal.method()
+    def process(self, batch: list, source_png: bytes, seed: int = 42, prompt: str = USER_PROMPT, up_res: int = 2560) -> list:
+        """batch: [(idx, target_png, mask_png)] -> [(idx, out_png)]"""
+        os.makedirs("/comfy/input", exist_ok=True)
+        open("/comfy/input/source.png", "wb").write(source_png)
+        out, t0 = [], time.time()
+        for idx, tp, mp in batch:
+            open("/comfy/input/target.png", "wb").write(tp)
+            open("/comfy/input/mask.png", "wb").write(mp)
+            req = urllib.request.Request("http://127.0.0.1:8188/prompt", headers={"Content-Type": "application/json"},
+                                         data=json.dumps({"prompt": _user_graph(seed, prompt, up_res)}).encode())
+            try:
+                pid = json.load(urllib.request.urlopen(req))["prompt_id"]
+            except urllib.error.HTTPError as e:
+                lg = open("/tmp/comfy.log").read()
+                bad = [ln for ln in lg.splitlines() if "IMPORT FAILED" in ln or "Error" in ln or "No module" in ln]
+                raise RuntimeError(e.read().decode()[:6000] + " IMPORT LOG: " + " | ".join(bad[-30:])[:4000])
+            while True:
+                hst = json.load(urllib.request.urlopen(f"http://127.0.0.1:8188/history/{pid}"))
+                if pid in hst:
+                    break
+                time.sleep(0.5)
+            if hst[pid]["status"].get("status_str") != "success":
+                raise RuntimeError("comfy failed: " + json.dumps(hst[pid]["status"])[:3000] + "\nLOG:" + open("/tmp/comfy.log").read()[-3000:])
+            im = hst[pid]["outputs"]["26"]["images"][0]
+            q = urllib.parse.urlencode({"filename": im["filename"], "subfolder": im["subfolder"], "type": im["type"]})
+            out.append((idx, urllib.request.urlopen(f"http://127.0.0.1:8188/view?{q}").read()))
+        print(f"userflow batch of {len(batch)} done in {time.time()-t0:.1f}s", flush=True)
         return out
 
 
@@ -1020,7 +1137,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
                 post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6,
                 stab_iters: int = 0, stab_taps: int = 2, stab_w: float = 0.8, cm_smooth: float = 0.0,
                 prop: bool = False, flow: str = "farneback", prop_thr: float = 7.0, prop_sc: float = 0.5,
-                prop_gate: float = 25.0, track_sigma: float = 2.0):
+                prop_gate: float = 25.0, track_sigma: float = 2.0, vae_up: bool = False, gen_res: int = 0):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -1129,7 +1246,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
         have = sorted(k for k in (int(x[:4]) for x in os.listdir(f"{d}/{reuse_raw}") if x.endswith(".png")) if k in frames and sm[k] is not None)
         keys = [k for k in have if k in set(keys)] if prop else have
     keyset = set(keys)
-    per = 14.0 * (res / 896) ** 2
+    per = 14.0 * ((gen_res or res) / 896) ** 2
     est = (len(keys) * per + max(1, min(GPU_PARALLEL, -(-len(keys) // 26))) * 60) * GPU_USD_PER_SEC * EST_FACTOR
     ev = np.array(list(errs.values())) if errs else np.array([0.0])
     info = {"frames_range": [start_frame, end], "head_frames": len(todo), "key_frames": len(keys), "promoted": int(sum(1 for e in errs.values() if e > promote_thr)),
@@ -1184,7 +1301,8 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
         n_gpu = max(1, min(GPU_PARALLEL, -(-len(crops) // 26)))   # ~26 frames per GPU container
         size = max(1, min(100, -(-len(crops) // n_gpu)))
         batches = [crops[k:k + size] for k in range(0, len(crops), size)]
-        for rs in Worker().process.map(batches, kwargs={"head_png": head_png, "steps": steps, "sampler": sampler, "seed": seed, "res": res, "href": href}):
+        for rs in Worker().process.map(batches, kwargs={"head_png": head_png, "steps": steps, "sampler": sampler, "seed": seed,
+                                                        "res": gen_res or res, "href": href, "vae_up": vae_up, "out_res": res}):
             for idx, png in rs:
                 outs[idx] = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
         gpu_wall = time.time() - tg
@@ -1900,6 +2018,90 @@ def animate_video(template_id: str, bfs_video: str, start_frame: int = 0, max_fr
     jobs_vol.commit()
     return {"output": out_name, "chunks": len(jobs), "ref_frame": ref_i, "head_frames": len(final), "gpu_wall_s": round(gpu_wall, 1),
             "total_s": round(time.time() - t0, 1)}
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=8, memory=32768, timeout=5400)
+def userflow_video(template_id: str, source_face_url: str, start_frame: int = 0, max_frames: int = 0, out_name: str = "",
+                   crop_res: int = 1280, seed: int = 42, prompt: str = USER_PROMPT, grow: int = 40, blur: int = 30):
+    """Runs the user-supplied ComfyUI workflow (UserFlowWorker) on every tracked head frame of a template video:
+    head crop at crop_res (their workflow scales the target to 1280), face+hair mask grown/blurred like their
+    MaskGrow(40, 30), result (2x from SeedVR2) scaled back and pasted with the same mask. No temporal smoothing,
+    so the output shows the workflow as it is."""
+    import cv2, numpy as np
+    t0 = time.time()
+    jobs_vol.reload()
+    d = f"{JOBS}/{template_id}"
+    meta = json.load(open(f"{d}/track.json"))
+    n, fps, W, H = meta["frames"], meta["fps"], meta["w"], meta["h"]
+    end = n if not max_frames else min(n, start_frame + max_frames)
+    sm = _smooth_track(meta["track"], n)
+    cap = cv2.VideoCapture(f"{d}/video.mp4")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frames = {}
+    for i in range(start_frame, end):
+        ok, f = cap.read()
+        if not ok:
+            break
+        frames[i] = f
+    cap.release()
+    todo = [i for i in frames if sm[i] is not None]
+    fa = _fa()
+    sp = f"/tmp/src_{uuid.uuid4().hex[:6]}.jpg"
+    _download(source_face_url, sp)
+    src = cv2.imread(sp)
+    fs = fa.get(src)
+    if not fs:
+        raise RuntimeError("no face in source photo")
+    f0 = max(fs, key=lambda q: (q.bbox[2] - q.bbox[0]) * (q.bbox[3] - q.bbox[1]))
+    x0, y0, x1, y1 = f0.bbox
+    src_crop, _ = _crop(src, (x0 + x1) / 2, (y0 + y1) / 2 - 0.15 * (y1 - y0), 2.5 * max(y1 - y0, x1 - x0), 1024)
+    source_png = cv2.imencode(".png", src_crop)[1].tobytes()
+    sess = _seg_session(False)
+    R = crop_res
+    geo, crops, masks, batch = {}, {}, {}, []
+    for i in todo:
+        g = _geom_clamped(sm[i], W, H)
+        geo[i] = g
+        crop, M = _crop(frames[i], g[0], g[1], g[2], R)
+        crops[i] = (crop, M)
+        cx_, cy_, S_, w_, h_, bx, by = g
+        sc = R / S_
+        capm = _head_mask(R, S_, w_, h_, bx, by, cx_, cy_, ax=1.0, ay=1.25, dy=0.2, fe=0.0) > 0.5
+        fx, fy = R / 2 + sc * (bx - cx_), R / 2 + sc * (by - cy_)
+        m = _head_region(sess, crop, fx, fy, w_ * sc, h_ * sc, capm)
+        m = cv2.dilate((m > 0.5).astype(np.float32), np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))
+        m = cv2.GaussianBlur(m, (0, 0), blur / 2.0)
+        masks[i] = m
+        batch.append((i, cv2.imencode(".png", crop)[1].tobytes(),
+                      cv2.imencode(".png", np.repeat((m * 255).astype(np.uint8)[..., None], 3, 2))[1].tobytes()))
+    n_gpu = max(1, min(GPU_PARALLEL, -(-len(batch) // 10)))
+    size = -(-len(batch) // n_gpu)
+    tg = time.time()
+    outs = {}
+    for rs in UserFlowWorker().process.map([batch[k:k + size] for k in range(0, len(batch), size)],
+                                           kwargs={"source_png": source_png, "seed": seed, "prompt": prompt, "up_res": 2 * R}):
+        for idx, png in rs:
+            outs[idx] = cv2.imdecode(np.frombuffer(png, np.uint8), cv2.IMREAD_COLOR)
+    gpu_wall = time.time() - tg
+    final = {}
+    for i, o in outs.items():
+        o = cv2.resize(o, (R, R), interpolation=cv2.INTER_AREA)
+        crop, M = crops[i]
+        inv = cv2.invertAffineTransform(M)
+        gw = cv2.warpAffine(o, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+        mw = cv2.warpAffine(masks[i], inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)[..., None]
+        final[i] = (frames[i].astype(np.float32) * (1 - mw) + gw * mw).clip(0, 255).astype(np.uint8)
+    out_name = out_name or f"userflow_{uuid.uuid4().hex[:6]}.mp4"
+    cmd = ["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+           "-ss", f"{start_frame / fps:.3f}", "-t", f"{(end - start_frame) / fps:.3f}", "-i", f"{d}/video.mp4", "-map", "0:v", "-map", "1:a?",
+           "-c:v", "libx264", "-crf", "14", "-preset", "medium", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", f"{d}/{out_name}"]
+    p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    for i in range(start_frame, start_frame + len(frames)):
+        p.stdin.write(final.get(i, frames[i]).tobytes())
+    p.stdin.close()
+    p.wait()
+    jobs_vol.commit()
+    return {"output": out_name, "head_frames": len(final), "gpus": n_gpu, "gpu_wall_s": round(gpu_wall, 1), "total_s": round(time.time() - t0, 1)}
 
 
 ARCFACE_128 = [[0.36167656, 0.40387734], [0.63696719, 0.40235469], [0.50019687, 0.56044219], [0.38710391, 0.72160547], [0.61507734, 0.72034453]]

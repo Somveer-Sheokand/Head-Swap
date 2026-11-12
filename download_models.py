@@ -32,6 +32,16 @@ FILES = [
     ("Kijai/WanVideo_comfy", "Lightx2v/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors", "loras/lightx2v_I2V_14B_480p_cfg_step_distill_rank64_bf16.safetensors"),
     ("Comfy-Org/Wan_2.2_ComfyUI_Repackaged", "split_files/vae/wan_2.1_vae.safetensors", "vae/wan_2.1_vae.safetensors"),
     ("Comfy-Org/Wan_2.1_ComfyUI_repackaged", "split_files/clip_vision/clip_vision_h.safetensors", "clip_vision/clip_vision_h.safetensors"),
+    # user workflow "qwen edit inpaint" (userflow_video): Qwen-Image-Edit-2509 + Lightning + InstantX ControlNet +
+    # Wan2.1 2x upscale VAE + SeedVR2 7B (all Apache-2.0)
+    ("Comfy-Org/Qwen-Image-Edit_ComfyUI", "split_files/diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors", "diffusion_models/qwen_image_edit_2509_fp8_e4m3fn.safetensors"),
+    ("lightx2v/Qwen-Image-Lightning", "Qwen-Image-Lightning-4steps-V2.0.safetensors", "loras/Qwen-Image-Lightning-4steps-V2.0.safetensors"),
+    ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors", "text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors"),
+    ("Comfy-Org/Qwen-Image_ComfyUI", "split_files/vae/qwen_image_vae.safetensors", "vae/qwen_image_vae.safetensors"),
+    ("spacepxl/Wan2.1-VAE-upscale2x", "Wan2.1_VAE_upscale2x_imageonly_real_v1.safetensors", "vae/Wan2.1_VAE_upscale2x_imageonly_real_v1.safetensors"),
+    ("Comfy-Org/Qwen-Image-InstantX-ControlNets", "split_files/controlnet/Qwen-Image-InstantX-ControlNet-Union.safetensors", "controlnet/Qwen-Image-InstantX-ControlNet-Union.safetensors"),
+    ("numz/SeedVR2_comfyUI", "seedvr2_ema_7b_fp16.safetensors", "SEEDVR2/seedvr2_ema_7b_fp16.safetensors"),
+    ("numz/SeedVR2_comfyUI", "ema_vae_fp16.safetensors", "SEEDVR2/ema_vae_fp16.safetensors"),
 ]
 
 
