@@ -137,6 +137,19 @@ only the head/hair back. Test on an 81-frame close-up (L40S, ~$0.25 per clip):
 Flicker drops ~9 %, but the video model changes identity details (eye colour drifted from blue-grey to brown,
 eyebrow shape) and smooths skin, so it is **not** enabled. Models are in `download_models.py`.
 
+### Experimental: HyperSwap face swap (`hyperswap_video`, not used by default)
+
+FaceFusion `hyperswap_1a_256` (ONNX, CPU, **licence ResearchRAIL - research use**), with smoothed 5-point landmarks,
+768 px pixel boost and a face-parsing mask (keeps hands / food). Same 81-frame close-up:
+
+| Version | Head flicker | Sharpness | Problems |
+|---|---|---|---|
+| current `best` (BFS) | 6.53 | 12.2 | - |
+| HyperSwap only | 5.81 | 15.3 | keeps the original man's hair / head shape; **opens the eyes when the actor closes them** |
+| BFS + HyperSwap | 6.43 | 10.8 | same eye problem, softer |
+
+Steadier and cheaper (~$0.05 per clip), but expressions and likeness are worse, so BFS stays the default.
+
 ## Known limitations
 
 - Each frame's head is generated independently; in `best` the smoothing passes bring the head flicker to about the

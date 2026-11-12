@@ -1407,6 +1407,124 @@ def refine_video(template_id: str, video_name: str, denoise: float = 0.3, start_
     return info | {"output": out_name, "gpu_wall_s": round(gpu_wall, 1), "total_s": round(time.time() - t0, 1), "denoise": denoise}
 
 
+ARCFACE_128 = [[0.36167656, 0.40387734], [0.63696719, 0.40235469], [0.50019687, 0.56044219], [0.38710391, 0.72160547], [0.61507734, 0.72034453]]
+FACE_ONLY_CLASSES = [1, 2, 4, 5, 6, 7, 10, 11, 12]     # skin, nose, eyes, brows, mouth, lips (no hair / ears / neck)
+
+
+@app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=8, memory=16384, timeout=3600)
+def hyperswap_video(template_id: str, video_name: str, source_face_url: str, start_frame: int = 0, max_frames: int = 0,
+                    out_name: str = "", model: str = "hyperswap_1a_256", pixel_boost: int = 768, kps_sigma: float = 1.5):
+    """EXPERIMENTAL face-only swap with FaceFusion HyperSwap (256 px ONNX, licence: ResearchRAIL - research use).
+    video_name = 'video.mp4' swaps the original footage; a finished BFS output gives the BFS + HyperSwap hybrid.
+    The model is deterministic (same input -> same face), 5-point landmarks are smoothed over time against wobble,
+    'pixel_boost' runs the 256 px model on (pixel_boost/256)^2 interleaved tiles for more detail on large faces, and the
+    face-parsing mask keeps hands / food in front of the face."""
+    import cv2, numpy as np, onnxruntime as ort, requests
+    t0 = time.time()
+    jobs_vol.reload()
+    mp = f"{JOBS}/_models/{model}.onnx"
+    if not os.path.exists(mp):
+        os.makedirs(os.path.dirname(mp), exist_ok=True)
+        r = requests.get(f"https://huggingface.co/facefusion/models-3.3.0/resolve/main/{model}.onnx", timeout=600)
+        r.raise_for_status()
+        open(mp, "wb").write(r.content)
+        jobs_vol.commit()
+    so = ort.SessionOptions()
+    so.intra_op_num_threads = 8
+    swapper = ort.InferenceSession(mp, so, providers=["CPUExecutionProvider"])
+    in_names = [x.name for x in swapper.get_inputs()]
+
+    d = f"{JOBS}/{template_id}"
+    meta = json.load(open(f"{d}/track.json"))
+    n, fps, W, H = meta["frames"], meta["fps"], meta["w"], meta["h"]
+    end = n if not max_frames else min(n, start_frame + max_frames)
+    sm = _smooth_track(meta["track"], n)
+    fa = _fa()
+    sp = f"/tmp/src_{uuid.uuid4().hex[:6]}.jpg"
+    _download(source_face_url, sp)
+    fs = fa.get(cv2.imread(sp))
+    if not fs:
+        raise RuntimeError("no face in source photo")
+    src_emb = max(fs, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])).normed_embedding.reshape(1, -1).astype(np.float32)
+
+    cap = cv2.VideoCapture(f"{d}/{video_name}")
+    cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+    frames = {}
+    for i in range(start_frame, end):
+        ok, fr = cap.read()
+        if not ok:
+            break
+        frames[i] = fr
+    cap.release()
+    kps = {}
+    for i, fr in frames.items():
+        if sm[i] is None:
+            continue
+        b = sm[i]
+        tx, ty = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        fl = fa.get(fr)
+        if fl:
+            q = min(fl, key=lambda q: abs((q.bbox[0] + q.bbox[2]) / 2 - tx) + abs((q.bbox[1] + q.bbox[3]) / 2 - ty))
+            if abs((q.bbox[0] + q.bbox[2]) / 2 - tx) < (b[2] - b[0]):
+                kps[i] = q.kps.astype(np.float32)
+    # temporal smoothing of the landmarks within contiguous runs (removes alignment wobble)
+    idx = sorted(kps)
+    runs, cur = [], []
+    for i in idx:
+        if cur and i != cur[-1] + 1:
+            runs.append(cur)
+            cur = []
+        cur.append(i)
+    if cur:
+        runs.append(cur)
+    skps = {}
+    rad = int(3 * kps_sigma)
+    for r in runs:
+        arr = np.stack([kps[i] for i in r])
+        k = np.exp(-0.5 * (np.arange(-rad, rad + 1) / max(kps_sigma, 1e-3)) ** 2)
+        k /= k.sum()
+        pad = np.pad(arr, ((rad, rad), (0, 0), (0, 0)), mode="edge")
+        for q, i in enumerate(r):
+            skps[i] = (pad[q:q + 2 * rad + 1] * k[:, None, None]).sum(0) if kps_sigma > 0 else arr[q]
+
+    sess = _seg_session(False)
+    pb, t = pixel_boost, pixel_boost // 256
+    tmpl = np.array(ARCFACE_128, np.float32) * pb
+    out = {}
+    for i in skps:
+        fr = frames[i]
+        M = cv2.estimateAffinePartial2D(skps[i], tmpl, method=cv2.RANSAC, ransacReprojThreshold=100)[0]
+        crop = cv2.warpAffine(fr, M, (pb, pb), borderMode=cv2.BORDER_REPLICATE, flags=cv2.INTER_AREA)
+        tiles = crop.reshape(256, t, 256, t, 3).transpose(1, 3, 0, 2, 4).reshape(t * t, 256, 256, 3)
+        outs_ = []
+        for tile in tiles:
+            x = ((tile[..., ::-1] / 255.0 - 0.5) / 0.5).transpose(2, 0, 1)[None].astype(np.float32)
+            feed = {nm: (src_emb if nm == "source" else x) for nm in in_names}
+            y = swapper.run(None, feed)[0][0].transpose(1, 2, 0) * 0.5 + 0.5
+            outs_.append(y.clip(0, 1)[..., ::-1] * 255)
+        sw = np.stack(outs_).reshape(t, t, 256, 256, 3).transpose(2, 0, 3, 1, 4).reshape(pb, pb, 3).astype(np.float32)
+        lab = cv2.resize(_parse_labels(sess, crop).astype(np.uint8), (pb, pb), interpolation=cv2.INTER_NEAREST)
+        m = np.isin(lab, FACE_ONLY_CLASSES).astype(np.float32)
+        m = cv2.erode(m, np.ones((int(0.01 * pb) | 1,) * 2, np.uint8))
+        e_ = np.clip(np.minimum(np.arange(pb), np.arange(pb)[::-1]) / (0.08 * pb), 0, 1).astype(np.float32)
+        m = cv2.GaussianBlur(m, (0, 0), 0.012 * pb) * np.minimum(e_[:, None], e_[None, :])
+        inv = cv2.invertAffineTransform(M)
+        gw = cv2.warpAffine(sw, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+        mw = cv2.warpAffine(m, inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)[..., None]
+        out[i] = (fr.astype(np.float32) * (1 - mw) + gw * mw).clip(0, 255).astype(np.uint8)
+
+    out_name = out_name or f"hyper_{uuid.uuid4().hex[:6]}.mp4"
+    p = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{W}x{H}", "-r", str(fps), "-i", "-",
+                          "-c:v", "libx264", "-crf", "12", "-preset", "medium", "-pix_fmt", "yuv420p", f"{d}/{out_name}"], stdin=subprocess.PIPE)
+    for i in range(start_frame, start_frame + len(frames)):
+        p.stdin.write(out.get(i, frames[i]).tobytes())
+    p.stdin.close()
+    p.wait()
+    jobs_vol.commit()
+    return {"output": out_name, "frames": len(frames), "swapped": len(out), "inputs": in_names,
+            "outputs": [x.name for x in swapper.get_outputs()], "total_s": round(time.time() - t0, 1)}
+
+
 def _put_file(path, url, ctype):
     import requests
     with open(path, "rb") as f:
