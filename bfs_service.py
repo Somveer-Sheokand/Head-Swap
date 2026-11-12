@@ -16,7 +16,10 @@ GPU_USD_PER_SEC = 1.95 / 3600  # L40S, approx
 PRESETS = {
     # post_*: second motion-aligned temporal pass over the finished heads; denoise: light temporal denoise (ffmpeg
     # hqdn3d) at the join. Tested on a 15 s close-up ad: head flicker 7.98 -> 6.87 (original footage 7.10), no ghosting
-    "best": dict(res=1024, href=768, key_step=1, taps=2, post_taps=3, post_w=0.8, post_thr=16.0, denoise=True),
+    # stab_*: head stabiliser (each generated head registered onto its motion-compensated neighbours, 2 passes);
+    # cm_smooth: colour-match parameters smoothed over +-2 frames. Same ad: added wobble -14 % shift / -20 % scale
+    "best": dict(res=1024, href=768, key_step=1, taps=2, post_taps=3, post_w=0.8, post_thr=16.0, denoise=True,
+                 stab_iters=2, stab_taps=2, stab_w=0.8, cm_smooth=2.0),
     # adaptive: small / far-away heads are generated at a smaller size (never below MIN_RES) - they are shrunk
     # to their on-screen size anyway, so the extra pixels cost GPU time without being visible
     "fast": dict(res=832, href=640, key_step=2, taps=2, adaptive=True),
@@ -27,7 +30,7 @@ EST_FACTOR = 2.0                     # real Modal bills were ~2x the plain per-f
 # Speed-ups that are built in but OFF until they have been tested once on a real job (each needs a redeploy):
 USE_SNAPSHOT = False   # Modal memory + GPU snapshot of the loaded ComfyUI -> cold start ~60-110 s -> ~10-20 s
 USE_SAGE = False       # SageAttention in ComfyUI -> ~15-30 % less GPU time per frame
-BLEND_CHUNK, BLEND_PAD = 24, 6       # frames per parallel blend container, overlap frames each side
+BLEND_CHUNK, BLEND_PAD = 24, 10      # frames per parallel blend container, overlap frames each side
 KEEP_DAYS = 14                       # outputs / uploads older than this are deleted automatically
 
 gpu_image = (
@@ -427,6 +430,33 @@ def _color_match(gen, orig, mask):
         gm, gs = g[..., c][r].mean(), g[..., c][r].std() + 1e-3
         om, os_ = o[..., c][r].mean(), o[..., c][r].std() + 1e-3
         g[..., c] = (g[..., c] - gm) * float(np.clip(os_ / gs, 0.85, 1.2)) + om
+    return cv2.cvtColor(np.clip(g, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+
+def _cm_params(gen, orig, mask):
+    """same transfer as _color_match, returned as per-channel LAB (gain, offset) so it can be smoothed over time"""
+    import cv2, numpy as np
+    r = mask < 0.02
+    if r.sum() < 500:
+        return None
+    g = cv2.cvtColor(gen, cv2.COLOR_BGR2LAB).astype(np.float32)
+    o = cv2.cvtColor(orig, cv2.COLOR_BGR2LAB).astype(np.float32)
+    p = np.zeros((3, 2), np.float32)
+    for c in range(3):
+        gm, gs = g[..., c][r].mean(), g[..., c][r].std() + 1e-3
+        om, os_ = o[..., c][r].mean(), o[..., c][r].std() + 1e-3
+        a = float(np.clip(os_ / gs, 0.85, 1.2))
+        p[c] = (a, om - gm * a)
+    return p
+
+
+def _cm_apply(gen, p):
+    import cv2, numpy as np
+    if p is None:
+        return gen
+    g = cv2.cvtColor(gen, cv2.COLOR_BGR2LAB).astype(np.float32)
+    for c in range(3):
+        g[..., c] = g[..., c] * p[c, 0] + p[c, 1]
     return cv2.cvtColor(np.clip(g, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
 
 
@@ -839,7 +869,8 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
           max_cost_usd: float = 1.2, seed: int = 42, steps: int = 8, sampler: str = "euler", dry_run: bool = False,
           reuse_raw: str = "", promote_thr: float = 6.0, key_step: int = 2, grain: bool = False, grain_max: float = 2.5, fix_top: bool = True, align_fix: bool = False, align_sigma: float = 4.0, taps: int = 1, seg_mask: bool = True, seg_full: bool = False, output_put_url: str = "", flow_comp: bool = False, soft_match: bool = False, seq_ref: int = 0,
                 gpu_only: bool = False, core: list = None, out_name: str = "",
-                post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6):
+                post_taps: int = 0, post_thr: float = 14.0, post_w: float = 0.6,
+                stab_iters: int = 0, stab_taps: int = 2, stab_w: float = 0.8, cm_smooth: float = 0.0):
     import cv2, numpy as np
     t0 = time.time()
     jobs_vol.reload()
@@ -1023,6 +1054,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
     if seg_mask:
         sess = _seg_session(seg_full)
         GW, MW, MASKDBG, SIG = {}, {}, {}, {}
+        CMP, RAWK = {}, {}
         for i in keys:
             g, M, crop = geoms[i]
             cx_, cy_, S_, w_, h_, bx, by = g
@@ -1038,6 +1070,11 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
             mask = cv2.GaussianBlur(u, (0, 0), 0.006 * res)
             kr = int(0.06 * res) | 1
             ring = cv2.dilate(u, np.ones((kr, kr), np.uint8))
+            if cm_smooth > 0:
+                # colour transfer parameters are smoothed over time first (no brightness / tint "breathing")
+                CMP[i] = _cm_params(outs[i], crop, ring)
+                RAWK[i] = (mask, M)
+                continue
             gen = _color_match(outs[i], crop, ring)
             if soft_match:
                 lo = cv2.Laplacian(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY), cv2.CV_32F)[mo > 0.6]
@@ -1054,20 +1091,97 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
             inv = cv2.invertAffineTransform(M)
             GW[i] = cv2.warpAffine(gen, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
             MW[i] = cv2.warpAffine(mask, inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32)
+        if cm_smooth > 0:
+            rad_ = int(3 * cm_smooth)
+            for r in runs:
+                kr_ = [k for k in r if k in RAWK]
+                for q_, k in enumerate(kr_):
+                    acc_, ws_ = np.zeros((3, 2), np.float32), 0.0
+                    for q2 in range(max(0, q_ - rad_), min(len(kr_), q_ + rad_ + 1)):
+                        p2 = CMP[kr_[q2]]
+                        if p2 is None:
+                            continue
+                        w2 = float(np.exp(-0.5 * ((q2 - q_) / cm_smooth) ** 2))
+                        acc_ += p2 * w2
+                        ws_ += w2
+                    gen = _cm_apply(outs[k], acc_ / ws_ if ws_ > 0 else None)
+                    mask, M = RAWK[k]
+                    inv = cv2.invertAffineTransform(M)
+                    GW[k] = cv2.warpAffine(gen, inv, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                    MW[k] = cv2.warpAffine(mask, inv, (W, H), flags=cv2.INTER_LINEAR, borderValue=0).astype(np.float32)
+            del RAWK
         sig_s = {}
         for r in runs:
             kr_ = [k for k in r if k in SIG]
             for q_, k in enumerate(kr_):
                 win_ = [SIG[x] for x in kr_[max(0, q_ - 4):q_ + 5]]
                 sig_s[k] = float(np.median(win_)) if win_ else 0.0
-        ksort = sorted(keys)
-        for i in keys:
+        def compose(i):
             nb = [k for k in (i - 1, i + 1) if k in MW and k in keyset]
             m = MW[i] * 0.5 + sum(MW[k] * (0.5 / len(nb)) for k in nb) if nb else MW[i]
             m = np.clip(m, 0, 1).astype(np.float32)
             CM[i] = m
             gwi = cv2.GaussianBlur(GW[i], (0, 0), sig_s[i]) if (soft_match and sig_s.get(i, 0) > 0.2) else GW[i]
             Kc[i] = (frames[i].astype(np.float32) * (1 - m[..., None]) + gwi.astype(np.float32) * m[..., None]).clip(0, 255).astype(np.uint8)
+
+        for i in keys:
+            compose(i)
+
+        # head stabiliser: every generated head is registered (similarity transform from dense flow inside the head
+        # mask) onto the motion-compensated average of its neighbours, so its own frame-to-frame shake is removed
+        # while the real head motion (carried by the neighbours' flow alignment) stays
+        kruns = [[k for k in r if k in keyset] for r in runs]
+        krun_of = {k: kr for kr in kruns for k in kr}
+        stab_stats = []
+        for _it in range(stab_iters):
+            corr = {}
+            for i in keys:
+                kr_ = krun_of[i]
+                nbs = [k for k in kr_ if k != i and abs(k - i) <= stab_taps]
+                if not nbs:
+                    continue
+                g = _geom(sm[i])
+                x0, y0, x1, y1 = roi_box(g)
+                tgt = np.mean([_aligned(frames[i], frames[k], Kc[k], (x0, y0, x1, y1)).astype(np.float32) for k in nbs], 0)
+                sc = min(1.0, 480.0 / max(x1 - x0, y1 - y0))
+                gc = cv2.cvtColor(cv2.resize(Kc[i][y0:y1, x0:x1], None, fx=sc, fy=sc), cv2.COLOR_BGR2GRAY)
+                gt = cv2.cvtColor(cv2.resize(tgt.clip(0, 255).astype(np.uint8), (gc.shape[1], gc.shape[0])), cv2.COLOR_BGR2GRAY)
+                fl = cv2.calcOpticalFlowFarneback(gc, gt, None, 0.5, 3, 15, 3, 5, 1.1, 0)
+                mm = cv2.resize(CM[i][y0:y1, x0:x1], (gc.shape[1], gc.shape[0]))
+                ys, xs = np.mgrid[0:gc.shape[0]:3, 0:gc.shape[1]:3]
+                sel = mm[ys, xs] > 0.6
+                if sel.sum() < 40:
+                    continue
+                src_p = np.stack([xs[sel], ys[sel]], 1).astype(np.float32)
+                dst_p = src_p + fl[ys[sel], xs[sel]]
+                A, _ = cv2.estimateAffinePartial2D(src_p, dst_p, method=cv2.RANSAC, ransacReprojThreshold=1.5)
+                if A is None:
+                    continue
+                s_ = float(np.hypot(A[0, 0], A[1, 0]))
+                th = float(np.arctan2(A[1, 0], A[0, 0]))
+                tx, ty = float(A[0, 2]) / sc, float(A[1, 2]) / sc
+                # damp + clamp (never more than 3 % shift / 4 % scale / 3 degrees per frame)
+                lim = 0.03 * max(x1 - x0, y1 - y0)
+                s_ = 1 + stab_w * float(np.clip(s_ - 1, -0.04, 0.04))
+                th = stab_w * float(np.clip(th, -0.052, 0.052))
+                L = np.array([[s_ * np.cos(th), -s_ * np.sin(th)], [s_ * np.sin(th), s_ * np.cos(th)]], np.float32)
+                t = np.array([tx, ty], np.float32) * stab_w
+                nt = float(np.hypot(*t))
+                if nt > lim:
+                    t *= lim / nt
+                # the transform was estimated in ROI coordinates (origin x0,y0): convert to full-frame coordinates
+                o = np.array([x0, y0], np.float32)
+                corr[i] = np.hstack([L, (t + o - L @ o)[:, None]]).astype(np.float32)
+                stab_stats.append((float(np.hypot(*t)), abs(s_ - 1)))
+            for i, A in corr.items():
+                GW[i] = cv2.warpAffine(GW[i], A, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+                MW[i] = cv2.warpAffine(MW[i], A, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
+            for i in keys:
+                compose(i)
+        if stab_stats:
+            ss = np.array(stab_stats)
+            align_stats = {"stab_corr_rms_px": round(float(np.sqrt((ss[:, 0] ** 2).mean())), 2),
+                           "stab_scale_rms_pct": round(float(np.sqrt((ss[:, 1] ** 2).mean())) * 100, 2)}
         del GW, MW
     else:
         for i in keys:
@@ -1205,7 +1319,7 @@ def _swap2_impl(template_id: str, source_face_url: str, start_frame: int = 0, ma
 
 
 @app.function(image=cpu_image, volumes={JOBS: jobs_vol}, cpu=4, memory=8192, timeout=1800)
-def measure(template_id: str, names: list):
+def measure(template_id: str, names: list, offset: int = 0):
     """High-frequency wobble of the head position/scale in a video (lower = steadier). 'video.mp4' = the real actor as baseline."""
     import cv2, numpy as np
     jobs_vol.reload()
@@ -1216,10 +1330,10 @@ def measure(template_id: str, names: list):
     res, P = {}, {}
     for name in names:
         cap = cv2.VideoCapture(f"{d}/{name}")
-        pos, i = {}, 0
+        pos, i = {}, (offset if name != "video.mp4" else 0)
         while True:
             ok, fr = cap.read()
-            if not ok:
+            if not ok or i >= len(sm):
                 break
             if sm[i] is not None:
                 b = sm[i]

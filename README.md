@@ -119,6 +119,22 @@ Head flicker = mean |frame - average of its two neighbours| in the head area (lo
 | + stronger second pass (`post_taps=3`, or +-2 with heavier weights) | 7.36-7.39 |
 | **+ temporal denoise (now the `best` default)** | **6.87-6.89** |
 
+**Wobble (head stabiliser + colour smoothing, now in `best`):** measured with dense optical flow inside the face
+(frame-to-frame motion of the swapped face minus the original face's motion; `wobble.py`-style check):
+
+| Variant | Added shift | Added scale | Head flicker |
+|---|---|---|---|
+| previous `best` | 8.47 px | 0.80 % | 6.87 |
+| + colour smoothing (`cm_smooth=2`) | 8.17 px | 0.79 % | 6.86 |
+| + head stabiliser (`stab_iters=2`) | 7.73 px | 0.68 % | 6.72 |
+| **+ both (now the default)** | **7.25 px** | **0.64 %** | **6.70** |
+| stronger (3 passes, +-3 frames, full strength) | 7.28 px | 0.65 % | 6.66 - no further gain |
+
+The stabiliser registers each generated head (similarity transform fitted to dense flow inside the head mask) onto
+the motion-compensated average of its neighbours, damped and clamped (max 3 % shift, 4 % scale, 3 degrees per frame).
+It adds ~3-5 min of CPU blending per video (parallel slices, `BLEND_PAD` raised to 10 frames).
+The face-detector based correction (`align_fix`) tested worse and stays off.
+
 No ghosting was visible in close-up eating shots. The second pass rejects neighbour pixels that do not match
 (fast motion, hands/food in front of the face), so it does not smear.
 
