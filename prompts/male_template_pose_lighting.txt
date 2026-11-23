@@ -1,0 +1,11 @@
+Replace only the central male model's face with the face of the man in the second image.
+
+Use his exact identity from the second image: the same face shape, eyes, eyebrows, nose, lips, skin tone and age, so he is instantly recognisable. Copy his facial hair exactly as it is in the second image, with the same amount, length and shape, and add none that is not there. Natural Indian facial features, realistic unretouched skin texture with visible pores, not airbrushed and not made younger.
+
+Keep the exact same head pose as the original: head tilted back with the chin raised, face tipped slightly toward the left side of the image, eyes looking down toward the camera. Keep the same relaxed, confident closed-mouth expression.
+
+Match the original head position, head size and perspective, and the original lighting: warm light from the left side of the image with a soft shadow on the right side of the face, the same contrast and skin colour grading. The face, neck and chest are one continuous skin tone.
+
+Preserve the original hairstyle, neck, body pose, clothing, background, typography and branding. No changes outside the target face region.
+
+Seamless photorealistic integration, premium fashion editorial photograph.

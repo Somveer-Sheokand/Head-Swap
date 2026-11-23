@@ -1,0 +1,9 @@
+Keep the central model's head in the first image exactly where and how it is, with the same orientation, tilt, chin height and eye direction, and change only the facial identity on it: the eyes, eyebrows, nose, lips, face shape, skin tone and age become those of the person in the second image, so the person is instantly recognisable.
+
+Copy the facial hair exactly as it is in the second image, with the same amount, length and shape, and add none that is not there. Realistic, unretouched skin texture with visible pores, not airbrushed, not beautified and not made younger. Keep the original facial expression and mouth shape, and the lip colour and makeup style of the first image.
+
+The lighting on the face stays exactly as in the first image: the same light direction, highlights, shadows, contrast and colour grading. The face, neck and chest are one continuous skin tone.
+
+Preserve the original hairstyle, head size, head position, both ears and everything worn on them, the neck and anything worn around it, body pose, clothing, background, typography and branding exactly as in the first image. No changes outside the face.
+
+Seamless photorealistic integration, premium fashion editorial photograph.
